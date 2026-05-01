@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+mvp-venv/
+
+# Data
+data/
+*.zip
+*.tar.gz
+
+# Checkpoints
+checkpoints/
+*.pt
+*.pth
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
