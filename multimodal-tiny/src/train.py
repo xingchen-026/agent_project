@@ -17,7 +17,6 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from transformers import GPT2Tokenizer
 from tqdm import tqdm
 
 from model import TinyMultimodal, ModelConfig
@@ -55,10 +54,10 @@ def train():
     device = torch.device("cpu")
     print(f"Device: {device}")
 
-    # ── Tokenizer ──
-    print("Loading tokenizer...")
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
+    # ── Tokenizer (zero-download, fully local) ──
+    from tokenizer import SimpleTokenizer
+    print("Building local tokenizer...")
+    tokenizer = SimpleTokenizer(max_vocab=10000)
 
     # ── Config ──
     cfg = ModelConfig(

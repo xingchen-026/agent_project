@@ -21,7 +21,7 @@ from typing import Optional
 @dataclass
 class ModelConfig:
     # Architecture
-    vocab_size: int = 50257
+    vocab_size: int = 10000
     dim: int = 384
     n_layers: int = 6
     n_heads: int = 6
