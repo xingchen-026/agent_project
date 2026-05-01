@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 from model import TinyMultimodal, ModelConfig
 from data import build_loaders
+from synthetic_data import SyntheticDataset
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -43,6 +44,8 @@ def get_args():
     parser.add_argument("--save_every", type=int, default=2)
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--log_dir", type=str, default="./logs")
+    parser.add_argument("--use_synthetic", action='store_true',
+                        help='Use synthetic data instead of COCO')
     parser.add_argument("--resume", type=str, default=None)
     return parser.parse_args()
 
@@ -75,14 +78,29 @@ def train():
 
     # ── Data ──
     print("Building data loaders...")
-    data_config = {
-        "train_size": args.train_size,
-        "val_size": args.val_size,
-        "batch_size": args.batch_size,
-        "image_size": args.image_size,
-        "max_text_len": args.max_text_len,
-    }
-    train_loader, val_loader = build_loaders(tokenizer, data_config)
+    if args.use_synthetic:
+        print("  Using synthetic data (no download needed)")
+        def collate(batch):
+            images, captions = zip(*batch)
+            images = torch.stack(images)
+            enc = tokenizer(list(captions), padding='max_length', truncation=True,
+                          max_length=args.max_text_len, return_tensors='pt')
+            return images, enc['input_ids'], enc['attention_mask']
+        train_ds = SyntheticDataset(num_samples=args.train_size, image_size=args.image_size)
+        val_ds   = SyntheticDataset(num_samples=args.val_size, image_size=args.image_size, seed=99)
+        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size,
+                            shuffle=True, collate_fn=collate, num_workers=0)
+        val_loader   = torch.utils.data.DataLoader(val_ds, batch_size=args.batch_size,
+                            shuffle=False, collate_fn=collate, num_workers=0)
+    else:
+        data_config = {
+            "train_size": args.train_size,
+            "val_size": args.val_size,
+            "batch_size": args.batch_size,
+            "image_size": args.image_size,
+            "max_text_len": args.max_text_len,
+        }
+        train_loader, val_loader = build_loaders(tokenizer, data_config)
 
     # ── Optimizer ──
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.1, betas=(0.9, 0.95))
