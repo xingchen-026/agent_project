@@ -51,7 +51,7 @@ def get_args():
 
 def train():
     args = get_args()
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     # ── Tokenizer (zero-download, fully local) ──
@@ -70,7 +70,7 @@ def train():
 
     # ── Model ──
     print(f"Building TinyMultimodal: {cfg.n_layers} layers, {cfg.dim} dim")
-    model = TinyMultimodal(cfg)
+    model = TinyMultimodal(cfg).to(device)
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Parameters: {total/1e6:.2f}M (trainable: {trainable/1e6:.2f}M)")

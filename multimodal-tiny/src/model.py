@@ -263,4 +263,4 @@ class TinyMultimodal(nn.Module):
             if text_ids.shape[1] > 100:
                 break
 
-        return tokenizer.decode(generated, skip_special_tokens=True)
+        return tokenizer.decode(generated)
