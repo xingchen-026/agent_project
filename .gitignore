@@ -2,26 +2,27 @@
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+mvp-venv/
 *.egg-info/
 dist/
 build/
-*.egg
-.venv/
-mvp-venv/
 
 # Data
 data/
 *.zip
 *.tar.gz
 
-# Checkpoints
+# Checkpoints & logs
 checkpoints/
+logs/
 *.pt
 *.pth
 
 # Environment
 .env
 .env.local
+*.log
 
 # OS
 .DS_Store
