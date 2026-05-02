@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
 """
-Tiny Unified Multimodal Transformer — v2.1 (Phase 2: Image Generation)
-======================================================================
-Phase 2 adds an image generation head for multimodal output capability.
+Tiny Unified Multimodal Transformer — v3.0 (Phase 3: Audio Modality)
+=====================================================================
+Phase 3 adds audio spectrogram patch processing alongside image+text.
 
-Phase 1 base:
-- 6-layer SwiGLU transformer with RoPE
-- QK-normalized causal self-attention
-- Image patch + text token fusion
-
-Phase 2 additions:
-- Image decoder head (patch-level pixel reconstruction)
-- Combined text CE + image MSE loss training
-- Image placeholder tokens for text-to-image inference
+Architecture:
+  [image_patches | audio_patches | text_tokens] → Transformer → outputs
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 
@@ -30,13 +23,11 @@ class ModelConfig:
     dim: int = 384
     n_layers: int = 6
     n_heads: int = 6
-    head_dim: int = 64  # dim // n_heads
     max_seq_len: int = 1024
-    num_image_tokens: int = 49  # 7x7 grid
 
     # Image processing
     image_size: int = 224
-    patch_size: int = 32  # 224/32 = 7 -> 49 patches
+    patch_size: int = 32
     use_type_embed: bool = True
 
     # Regularization
@@ -45,22 +36,32 @@ class ModelConfig:
 
     # MLP
     mlp_multiplier: int = 4
-    mlp_type: str = "swiglu"  # swiglu or relu
 
     # RoPE
     rope_theta: float = 10000.0
 
-    # --- Phase 2: Image Generation ---
-    img_generation: bool = True        # Enable image generation head
-    img_decoder_hidden: int = 512      # Hidden dim of image decoder MLP
+    # Phase 2: Image Generation
+    img_generation: bool = True
+    img_decoder_hidden: int = 512
+
+    # --- Phase 3: Audio Modality ---
+    use_audio: bool = True
+    n_mels: int = 128
+    audio_n_fft: int = 512
+    audio_hop_length: int = 128
+    audio_time_frames: int = 128
+    audio_patch_freq: int = 16
+    audio_patch_time: int = 16
 
     def __post_init__(self):
         self.head_dim = self.dim // self.n_heads
         patches_per_side = self.image_size // self.patch_size
         self.num_image_tokens = patches_per_side * patches_per_side
+        self.num_audio_tokens = (self.n_mels // self.audio_patch_freq) * \
+                                (self.audio_time_frames // self.audio_patch_time)
 
 
-# ── Components ─────────────────────────────────────────────────────────
+# ── Common Components ────────────────────────────────────────────────
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -94,14 +95,13 @@ def apply_rotary(x, cos, sin):
     return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
 
 
-class CausalSelfAttention(nn.Module):
+class SelfAttention(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.n_heads = cfg.n_heads
         self.head_dim = cfg.head_dim
         self.qkv = nn.Linear(cfg.dim, 3 * cfg.dim, bias=False)
         self.proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
-        self.attn_drop = nn.Dropout(cfg.attention_dropout)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
@@ -109,12 +109,10 @@ class CausalSelfAttention(nn.Module):
         B, T, D = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(2)
-
         q, k = self.q_norm(q).transpose(1, 2), self.k_norm(k).transpose(1, 2)
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
-
         out = F.scaled_dot_product_attention(q, k, v.transpose(1, 2),
-                                              attn_mask=mask, is_causal=(mask is None))
+                                             attn_mask=mask, is_causal=(mask is None))
         return self.proj(out.transpose(1, 2).reshape(B, T, D))
 
 
@@ -134,7 +132,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.attn_norm = RMSNorm(cfg.dim)
-        self.attn = CausalSelfAttention(cfg)
+        self.attn = SelfAttention(cfg)
         self.mlp_norm = RMSNorm(cfg.dim)
         self.mlp = SwiGLU(cfg.dim, cfg.mlp_multiplier)
 
@@ -144,84 +142,112 @@ class TransformerBlock(nn.Module):
         return x
 
 
-# ── Image Decoder Head (Phase 2) ─────────────────────────────────────
+# ── Decoder Heads ────────────────────────────────────────────────────
 
 class ImageDecoderHead(nn.Module):
-    """
-    Reconstructs image patches from transformer hidden states.
-    Takes [B, n_patches, dim] and outputs [B, n_patches, C*P*P].
-    """
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        patch_pixels = 3 * cfg.patch_size * cfg.patch_size  # C*H*W per patch
+        patch_pixels = 3 * cfg.patch_size * cfg.patch_size
         self.net = nn.Sequential(
             nn.Linear(cfg.dim, cfg.img_decoder_hidden),
             nn.GELU(),
             nn.Linear(cfg.img_decoder_hidden, patch_pixels),
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states):
         return self.net(hidden_states)
 
 
+class AudioDecoderHead(nn.Module):
+    """Reconstruct mel spectrogram patches from hidden states."""
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        patch_pixels = cfg.audio_patch_freq * cfg.audio_patch_time  # 1-channel mel
+        self.net = nn.Sequential(
+            nn.Linear(cfg.dim, cfg.dim // 2),
+            nn.GELU(),
+            nn.Linear(cfg.dim // 2, patch_pixels),
+        )
+
+    def forward(self, hidden_states):
+        return self.net(hidden_states)
+
+
+# ── Utility ──────────────────────────────────────────────────────────
+
 def patches_to_image(patches, patch_size, image_size):
-    """
-    Rearrange patches [B, N, C*P*P] back to image tensor [B, C, H, W].
-    Used for visualization and saving generated images.
-    """
     B, N, _ = patches.shape
     C = 3
     p = patch_size
-    h = w = image_size // p  # patches per side
-    img = patches.reshape(B, h, w, C, p, p)
-    img = img.permute(0, 3, 1, 4, 2, 5).reshape(B, C, h * p, w * p)
-    return img
+    h = w = image_size // p
+    try:
+        img = patches.reshape(B, h, w, C, p, p)
+        img = img.permute(0, 3, 1, 4, 2, 5).reshape(B, C, h * p, w * p)
+        return img
+    except RuntimeError:
+        return patches  # return raw if reshape fails
 
 
-# ── Unified Model (v2.1) ──────────────────────────────────────────────
+def mel_patches_to_spectrogram(patches, cfg):
+    """Rebuild mel spectrogram from patches: [B, N, F*T] → [B, 1, n_mels, time_frames]."""
+    n_freq_patches = cfg.n_mels // cfg.audio_patch_freq
+    n_time_patches = cfg.audio_time_frames // cfg.audio_patch_time
+    pf, pt = cfg.audio_patch_freq, cfg.audio_patch_time
+    spec = patches.reshape(-1, n_freq_patches, n_time_patches, pf, pt)
+    spec = spec.permute(0, 1, 3, 2, 4).reshape(-1, 1, cfg.n_mels, cfg.audio_time_frames)
+    return spec
+
+
+# ── Unified Model v3.0 ──────────────────────────────────────────────
 
 class TinyMultimodal(nn.Module):
     """
-    Tiny unified multimodal transformer with bidirectional generation.
-    Processes [image_patches, text_tokens] in one autoregressive sequence.
-    Phase 2: can also reconstruct images from hidden states.
-
-    Inference modes:
-      - img_to_text: standard, predicts text from image+text input
-      - text_to_img: generates image from text-only input (uses [IMG] placeholder)
-      - joint: predicts both text and reconstructs image from input
+    Tiny unified multimodal transformer — supports image + audio + text.
+    Token order: [image_patches | audio_patches | text_tokens]
+    Attention: image↔audio all-to-all, text causal (attends to all modalities)
     """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
 
-        # Text embeddings
+        # Text
         self.text_embed = nn.Embedding(cfg.vocab_size, cfg.dim)
 
-        # Image patch projection
+        # Image projection
         self.img_proj = nn.Linear(3 * cfg.patch_size * cfg.patch_size, cfg.dim)
         self.img_norm = RMSNorm(cfg.dim)
 
-        # Type embedding (0=text, 1=image)
-        if cfg.use_type_embed:
-            self.type_embed = nn.Embedding(2, cfg.dim)
-        # Image placeholder token for text-to-image generation
+        # Audio projection: 1-channel mel patches
+        if cfg.use_audio:
+            self.audio_proj = nn.Linear(
+                cfg.audio_patch_freq * cfg.audio_patch_time, cfg.dim)
+            self.audio_norm = RMSNorm(cfg.dim)
+            self.audio_decoder = AudioDecoderHead(cfg)
+
+        # Placeholder tokens for text-to-modality generation
         if cfg.img_generation:
             self.img_placeholder = nn.Parameter(torch.randn(1, 1, cfg.dim) * 0.02)
+        if cfg.use_audio:
+            self.audio_placeholder = nn.Parameter(torch.randn(1, 1, cfg.dim) * 0.02)
 
-        # Transformer blocks
+        # Type embedding: 0=text, 1=image, 2=audio, 3=img_placeholder, 4=audio_placeholder
+        if cfg.use_type_embed:
+            n_types = 5 if cfg.use_audio else 3
+            self.type_embed = nn.Embedding(n_types, cfg.dim)
+
+        # Transformer
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.dim)
 
-        # LM head (tied)
+        # LM head
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         self.text_embed.weight = self.lm_head.weight
 
         # RoPE
         self.rope = RotaryEmbedding(cfg.head_dim, cfg.max_seq_len, cfg.rope_theta)
 
-        # Phase 2: Image generation head
+        # Image decoder
         if cfg.img_generation:
             self.img_decoder = ImageDecoderHead(cfg)
 
@@ -237,108 +263,152 @@ class TinyMultimodal(nn.Module):
         isz = self.cfg.image_size
         return (isz // ps) ** 2
 
+    def get_num_audio_tokens(self, mels=None):
+        if mels is not None:
+            # Actual number from mel spectrogram dimensions
+            H, W = mels.shape[-2], mels.shape[-1]
+            pf, pt = self.cfg.audio_patch_freq, self.cfg.audio_patch_time
+            return (H // pf) * (W // pt)
+        return (self.cfg.n_mels // self.cfg.audio_patch_freq) * \
+               (self.cfg.audio_time_frames // self.cfg.audio_patch_time)
+
     def _image_to_patches(self, images):
-        """Convert [B, C, H, W] images to [B, N_patches, C*P*P] patches."""
         B, C, H, W = images.shape
         p = self.cfg.patch_size
         patches = images.unfold(2, p, p).unfold(3, p, p)
         patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(B, -1, C * p * p)
         return patches
 
-    def _make_attention_mask(self, n_img_tokens, total_len, bidirectional_img=True, device=None):
+    def _spectrogram_to_patches(self, mels):
         """
-        Build attention mask.
-        - Image region: all-to-all (bidirectional within images)
-        - Text region: causal (can attend to all images + previous text)
+        Convert [B, 1, n_mels, T] mel spectrogram to [B, N, F*T] patches.
         """
+        B, C, H, W = mels.shape
+        pf, pt = self.cfg.audio_patch_freq, self.cfg.audio_patch_time
+        patches = mels.unfold(2, pf, pf).unfold(3, pt, pt)
+        patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(B, -1, pf * pt)
+        return patches
+
+    def _make_attention_mask(self, n_img, n_audio, total_len, device=None):
+        """Image↔Audio all-to-all, Text causal."""
         mask = torch.full((total_len, total_len), float('-inf'), device=device)
-        # Image region: full bidirectional
-        mask[:n_img_tokens, :n_img_tokens] = 0
-        # Text -> all images + causal in text
-        for i in range(n_img_tokens, total_len):
-            mask[i, :i + 1] = 0  # causal + attend to images (images are at indices < n_img_tokens)
+        end_sensory = n_img + n_audio
+        # Sensory region (image + audio): all-to-all
+        mask[:end_sensory, :end_sensory] = 0
+        # Text: causal + attend to all sensory
+        for i in range(end_sensory, total_len):
+            mask[i, :i + 1] = 0
         return mask
 
-    def forward(self, text_ids, images=None, return_img=False, img_gen_mode=False):
+    def forward(self, text_ids, images=None, audios=None,
+                return_img=False, return_audio=False,
+                img_gen_mode=False, audio_gen_mode=False):
         """
         Args:
-            text_ids: [B, T] token IDs
-            images: [B, C, H, W] or None for text-to-image mode
-            return_img: if True, also return image reconstruction
-            img_gen_mode: if True, use image placeholder tokens
+            text_ids: [B, T]
+            images: [B, 3, H, W] or None
+            audios: [B, 1, n_mels, T] or None
         Returns:
-            text_logits: [B, T, vocab_size]
-            If return_img:
-                (text_logits, img_recon, target_patches)
+            text_logits or (text_logits, recon_dict)
         """
         B = text_ids.shape[0]
         device = text_ids.device
-        n_img_tokens = self.get_num_image_tokens()
+        n_img = self.get_num_image_tokens()
+        target_patches = {}
+        tokens_list = []
+        type_ids_list = []
 
         # ── Image tokens ──
         if img_gen_mode or images is None:
-            # Text-to-image generation: use learned [IMG] placeholder
-            img_tokens = self.img_placeholder.expand(B, n_img_tokens, -1)
-            img_type = torch.full((B, n_img_tokens), 1, device=device)  # type=1: image (placeholder)
-            target_patches = None
+            img_tokens = self.img_placeholder.expand(B, n_img, -1)
+            ttype = torch.full((B, n_img), 3, device=device, dtype=torch.long)
+            target_patches['image'] = None
         else:
-            # Normal mode: project real image patches
             patches = self._image_to_patches(images)
-            target_patches = patches.detach()  # ground truth for reconstruction loss
+            target_patches['image'] = patches.detach()
             img_tokens = self.img_norm(self.img_proj(patches))
-            img_type = torch.full((B, n_img_tokens), 1, device=device)  # type=1: image
+            ttype = torch.full((B, n_img), 1, device=device, dtype=torch.long)
+        tokens_list.append(img_tokens)
+        type_ids_list.append(ttype)
 
-        if self.cfg.use_type_embed:
-            img_tokens = img_tokens + self.type_embed(img_type)
+        # ── Audio tokens ──
+        n_aud = 0
+        if self.cfg.use_audio:
+            if audio_gen_mode or audios is None:
+                n_aud = self.get_num_audio_tokens()  # from config
+                aud_tokens = self.audio_placeholder.expand(B, n_aud, -1)
+                atype = torch.full((B, n_aud), 4, device=device, dtype=torch.long)
+                target_patches['audio'] = None
+            else:
+                n_aud = self.get_num_audio_tokens(audios)
+                aud_patches = self._spectrogram_to_patches(audios)
+                target_patches['audio'] = aud_patches.detach()
+                aud_tokens = self.audio_norm(self.audio_proj(aud_patches))
+                atype = torch.full((B, n_aud), 2, device=device, dtype=torch.long)
+            tokens_list.append(aud_tokens)
+            type_ids_list.append(atype)
 
         # ── Text tokens ──
         text_tokens = self.text_embed(text_ids)
+        ttype = torch.zeros(B, text_ids.shape[1], device=device, dtype=torch.long)
+        tokens_list.append(text_tokens)
+        type_ids_list.append(ttype)
+
+        # ── Combine ──
+        x = torch.cat(tokens_list, dim=1)
         if self.cfg.use_type_embed:
-            text_type = torch.zeros(B, text_ids.shape[1], device=device, dtype=torch.long)
-            text_tokens = text_tokens + self.type_embed(text_type)
+            type_ids = torch.cat(type_ids_list, dim=1)
+            x = x + self.type_embed(type_ids)
 
-        # ── Concatenate ──
-        x = torch.cat([img_tokens, text_tokens], dim=1)
         total_len = x.shape[1]
-
-        # ── RoPE ──
         cos, sin = self.rope(total_len, device)
+        mask = self._make_attention_mask(n_img, n_aud, total_len, device)
 
-        # ── Attention mask ──
-        mask = self._make_attention_mask(n_img_tokens, total_len, device=device)
-
-        # ── Transformer ──
         for block in self.blocks:
             x = block(x, cos, sin)
         x = self.final_norm(x)
 
         # ── Text output ──
-        text_logits = self.lm_head(x[:, n_img_tokens:])
+        n_sensory = n_img + n_aud
+        text_logits = self.lm_head(x[:, n_sensory:])
+
+        # ── Reconstruction outputs ──
+        results = {'text_logits': text_logits}
 
         if return_img and self.cfg.img_generation:
-            # Image reconstruction from image-token hidden states
-            img_hidden = x[:, :n_img_tokens]  # [B, N_patches, dim]
-            img_recon = self.img_decoder(img_hidden)  # [B, N_patches, C*P*P]
-            return text_logits, img_recon, target_patches
+            img_hidden = x[:, :n_img]
+            results['img_recon'] = self.img_decoder(img_hidden)
+            results['target_img'] = target_patches.get('image')
 
+        if return_audio and self.cfg.use_audio and n_aud > 0 and audios is not None:
+            aud_hidden = x[:, n_img:n_img + n_aud]
+            results['aud_recon'] = self.audio_decoder(aud_hidden)
+            results['target_aud'] = target_patches.get('audio')
+
+        if return_img or return_audio:
+            return results
         return text_logits
 
     # ── Inference ──
 
     @torch.no_grad()
-    def generate_text(self, image, tokenizer, max_len=50, temperature=0.8, top_k=50):
-        """Generate text description from an image (img→text)."""
+    def generate_text(self, image, tokenizer, audio=None, max_len=50,
+                      temperature=0.8, top_k=50):
+        """Generate text description from image (optionally + audio)."""
         self.eval()
         device = next(self.parameters()).device
-        if image.dim() == 3:
+        if image is not None and image.dim() == 3:
             image = image.unsqueeze(0)
+        if audio is not None and audio.dim() == 3:
+            audio = audio.unsqueeze(0)
 
         bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
         text_ids = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
-
         generated = []
+
         for _ in range(max_len):
-            logits = self(text_ids, image)
+            out = self(text_ids, images=image, audios=audio)
+            logits = out if isinstance(out, torch.Tensor) else out['text_logits']
             next_logits = logits[0, -1] / temperature
 
             if top_k > 0:
@@ -352,60 +422,46 @@ class TinyMultimodal(nn.Module):
                 break
             generated.append(next_id)
             text_ids = torch.cat([text_ids, torch.tensor([[next_id]], device=device)], dim=1)
-
             if text_ids.shape[1] > 100:
                 break
 
         return tokenizer.decode(generated)
 
     @torch.no_grad()
-    def generate_image(self, text_ids, tokenizer, num_steps=1, temperature=1.0):
-        """
-        Generate an image from text using iterative refinement.
-        (Experimental: applies decoder to [IMG] placeholder hidden states)
-
-        Args:
-            text_ids: [B, T] token IDs
-            tokenizer: tokenizer for decoding
-            num_steps: number of refinement steps (1 = single pass)
-        Returns:
-            image: [B, C, H, W] tensor in [-1, 1] range
-        """
+    def generate_image(self, text_ids, tokenizer):
+        """Generate image from text."""
         self.eval()
         device = next(self.parameters()).device
-
-        # Forward with placeholder tokens
-        _, img_recon, _ = self(text_ids, images=None, return_img=True, img_gen_mode=True)
-
-        if num_steps > 1:
-            # Iterative refinement (placeholder for future work)
-            pass
-
-        # Convert patches to image
+        out = self(text_ids, images=None, return_img=True, img_gen_mode=True)
+        img_recon = out['img_recon']
         p = self.cfg.patch_size
-        img_size = self.cfg.image_size
-        img = patches_to_image(img_recon, p, img_size)
+        img = patches_to_image(img_recon, p, self.cfg.image_size)
         return torch.clamp(img, -1.0, 1.0)
 
     @torch.no_grad()
     def reconstruct_image(self, images):
-        """
-        Reconstruct input images through the model (autoencoding).
-        Useful for checking how well the model preserves visual info.
-        """
+        """Reconstruct images."""
         self.eval()
         device = next(self.parameters()).device
         if images.dim() == 3:
             images = images.unsqueeze(0)
         images = images.to(device)
-
-        # Create dummy text (just BOS token)
-        bos_id = 0  # pad token used as BOS
+        bos_id = 0
         text_ids = torch.full((images.shape[0], 1), bos_id, dtype=torch.long, device=device)
-
-        _, img_recon, _ = self(text_ids, images, return_img=True)
-
-        p = self.cfg.patch_size
-        img_size = self.cfg.image_size
-        img = patches_to_image(img_recon, p, img_size)
+        out = self(text_ids, images=images, return_img=True)
+        img = patches_to_image(out['img_recon'], self.cfg.patch_size, self.cfg.image_size)
         return torch.clamp(img, -1.0, 1.0)
+
+    @torch.no_grad()
+    def reconstruct_audio(self, audios):
+        """Reconstruct audio mel spectrograms."""
+        self.eval()
+        device = next(self.parameters()).device
+        if audios.dim() == 3:
+            audios = audios.unsqueeze(0)
+        audios = audios.to(device)
+        bos_id = 0
+        text_ids = torch.full((audios.shape[0], 1), bos_id, dtype=torch.long, device=device)
+        out = self(text_ids, audios=audios, return_audio=True)
+        spec = mel_patches_to_spectrogram(out['aud_recon'], self.cfg)
+        return torch.clamp(spec, -1.0, 1.0)

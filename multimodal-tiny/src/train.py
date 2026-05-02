@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 """
-Training script for Tiny Multimodal Model — v2.1 (Phase 2)
-==========================================================
-Phase 2 adds image generation head with combined loss training.
-Supports:
-  - Phase 1 style: text-only CE loss (backward compatible)
-  - Phase 2: combined text CE + image MSE reconstruction loss
-  - Resume from Phase 1 checkpoints (auto-detects missing keys)
+Training script — v3.0 (Phase 3: Audio Modality)
+=================================================
+Supports Phase 1 (text), Phase 2 (text+image), Phase 3 (text+image+audio).
 """
 
 import os
 import sys
-import time
 import json
-import math
 import argparse
 from pathlib import Path
 
@@ -25,9 +19,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from tqdm import tqdm
 
-from model import TinyMultimodal, ModelConfig, patches_to_image
+from model import TinyMultimodal, ModelConfig, patches_to_image, mel_patches_to_spectrogram
 from data import build_loaders
 from synthetic_data import SyntheticDataset
+from audio_synthetic import AudioDataset, get_audio_tokenizer_description
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -35,6 +30,7 @@ warnings.filterwarnings('ignore')
 
 def get_args():
     parser = argparse.ArgumentParser(description="Train Tiny Multimodal Model")
+
     # Data
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
@@ -42,105 +38,77 @@ def get_args():
     parser.add_argument("--val_size", type=int, default=500)
     parser.add_argument("--max_text_len", type=int, default=48)
     parser.add_argument("--use_synthetic", action='store_true')
+
     # Model
     parser.add_argument("--dim", type=int, default=384)
     parser.add_argument("--layers", type=int, default=6)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--patch_size", type=int, default=32)
-    # Phase 2: Generation
-    parser.add_argument("--img_gen", action='store_true', default=True,
-                        help="Enable image generation head + combined loss (Phase 2)")
-    parser.add_argument("--img_loss_weight", type=float, default=1.0,
-                        help="Weight of image MSE loss relative to text CE loss")
-    parser.add_argument("--img_decoder_hidden", type=int, default=512,
-                        help="Hidden dim of image decoder MLP")
+
+    # Phase 2: Image generation
+    parser.add_argument("--img_gen", action='store_true', default=True)
+    parser.add_argument("--img_loss_weight", type=float, default=1.0)
+    parser.add_argument("--img_decoder_hidden", type=int, default=512)
+
+    # Phase 3: Audio
+    parser.add_argument("--use_audio", action='store_true',
+                        help="Enable audio modality training")
+    parser.add_argument("--aud_loss_weight", type=float, default=1.0)
+    parser.add_argument("--aud_train_size", type=int, default=5000)
+    parser.add_argument("--aud_val_size", type=int, default=200)
+
     # Training
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--save_every", type=int, default=2)
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--log_dir", type=str, default="./logs")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Phase 1 checkpoint path for transfer learning")
+    parser.add_argument("--resume", type=str, default=None)
     return parser.parse_args()
 
 
 def compute_text_loss(logits, text_ids, attn_mask):
-    """Cross-entropy loss for text prediction (shifted)."""
     shift_logits = logits[:, :-1].reshape(-1, logits.size(-1))
     shift_labels = text_ids[:, 1:].reshape(-1)
     shift_mask = attn_mask[:, 1:].reshape(-1)
-
     loss = F.cross_entropy(shift_logits, shift_labels, reduction='none')
     return (loss * shift_mask).sum() / shift_mask.sum()
 
 
-def compute_image_loss(img_recon, target_patches):
-    """MSE loss for image patch reconstruction."""
-    return F.mse_loss(img_recon, target_patches)
+def compute_mse_loss(pred, target):
+    if pred is None or target is None:
+        return torch.tensor(0.0, device=pred.device if pred is not None else 'cpu')
+    return F.mse_loss(pred, target)
 
 
-def load_checkpoint_with_flexibility(model, checkpoint_path, device='cpu'):
-    """
-    Load checkpoint with flexibility for Phase 1→Phase 2 migration.
-    Handles missing keys (new Phase 2 weights) and mismatched sizes.
-    """
+def load_checkpoint_flexible(model, checkpoint_path, device='cpu'):
     print(f"  Loading checkpoint: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location=device)
+    state_dict = ckpt.get('model_state_dict', ckpt)
 
-    if 'model_state_dict' in ckpt:
-        state_dict = ckpt['model_state_dict']
-    else:
-        state_dict = ckpt  # bare state_dict
+    model_dict = model.state_dict()
+    loaded = 0
+    for key in state_dict:
+        if key in model_dict and state_dict[key].shape == model_dict[key].shape:
+            model_dict[key] = state_dict[key]
+            loaded += 1
 
-    # Try strict first, then flexible
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        print(f"  ✓ Loaded strictly (full match)")
-        return ckpt
-    except Exception as e:
-        missing = set()
-        unexpected = set()
-        for key in model.state_dict():
-            if key not in state_dict:
-                missing.add(key)
-        for key in state_dict:
-            if key not in model.state_dict():
-                unexpected.add(key)
-            elif state_dict[key].shape != model.state_dict()[key].shape:
-                print(f"  Shape mismatch: {key} "
-                      f"ckpt={list(state_dict[key].shape)} "
-                      f"model={list(model.state_dict()[key].shape)}")
+    model.load_state_dict(model_dict, strict=True)
+    print(f"  ✓ Loaded {loaded}/{len(model_dict)} keys")
 
-        if missing:
-            print(f"  Missing keys in checkpoint (will init fresh): {sorted(missing)}")
-        if unexpected:
-            print(f"  Unexpected keys in checkpoint (skipping): {sorted(unexpected)}")
-
-        # Load matching keys
-        model_dict = model.state_dict()
-        for key in state_dict:
-            if key in model_dict and state_dict[key].shape == model_dict[key].shape:
-                model_dict[key] = state_dict[key]
-        model.load_state_dict(model_dict, strict=True)
-        print(f"  ✓ Loaded {len(state_dict) - len(unexpected)}/{len(model_dict)} keys")
-
-        # Keep only what we need from ckpt meta
-        if 'optimizer_state_dict' in ckpt and 'epoch' in ckpt:
-            return {
-                'epoch': ckpt.get('epoch', -1),
-                'optimizer_state_dict': ckpt.get('optimizer_state_dict'),
-                'train_loss': ckpt.get('train_loss'),
-                'val_loss': ckpt.get('val_loss'),
-                'best_loss': ckpt.get('best_loss', float('inf')),
-            }
-        return {'epoch': -1, 'best_loss': float('inf')}
+    info = {}
+    if 'epoch' in ckpt:
+        info = {'epoch': ckpt['epoch'], 'best_loss': ckpt.get('best_loss', float('inf'))}
+    return info or {'best_loss': float('inf')}
 
 
 def train():
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Phase 2 Image Generation: {'ENABLED' if args.img_gen else 'DISABLED'}")
+    phase = "Phase 3 (text+img+audio)" if args.use_audio else \
+            "Phase 2 (text+img gen)" if args.img_gen else \
+            "Phase 1 (text only)"
+    print(f"Mode: {phase}")
 
     # ── Tokenizer ──
     from tokenizer import SimpleTokenizer
@@ -156,49 +124,79 @@ def train():
         vocab_size=tokenizer.vocab_size,
         img_generation=args.img_gen,
         img_decoder_hidden=args.img_decoder_hidden,
+        use_audio=args.use_audio,
     )
 
     # ── Model ──
-    print(f"Building TinyMultimodal v2.1: {cfg.n_layers} layers, {cfg.dim} dim")
+    print(f"Building TinyMultimodal v3.0: {cfg.n_layers} layers, {cfg.dim} dim")
     model = TinyMultimodal(cfg).to(device)
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Parameters: {total/1e6:.2f}M (trainable: {trainable/1e6:.2f}M)")
+    if total > 30_000_000:
+        print(f"  ⚠️  Over 30M budget!")
 
-    # ── Phase 1 → Phase 2 checkpoint migration ──
+    # ── Resume ──
     start_epoch = 0
     best_loss = float('inf')
     if args.resume:
-        ckpt_info = load_checkpoint_with_flexibility(model, args.resume, device)
-        start_epoch = ckpt_info.get('epoch', -1) + 1
-        best_loss = ckpt_info.get('best_loss', float('inf'))
-        print(f"  Resumed at epoch {start_epoch}, best_loss={best_loss:.4f}")
+        info = load_checkpoint_flexible(model, args.resume, device)
+        start_epoch = info.get('epoch', -1) + 1
+        best_loss = info.get('best_loss', float('inf'))
+        print(f"  Resumed at epoch {start_epoch}")
 
     # ── Data ──
     print("Building data loaders...")
+    use_img = args.img_gen or not args.use_audio
+
+    def image_collate(batch):
+        images, captions = zip(*batch)
+        images = torch.stack(images)
+        enc = tokenizer(list(captions), padding='max_length', truncation=True,
+                        max_length=args.max_text_len, return_tensors='pt')
+        return {'images': images, 'text_ids': enc['input_ids'],
+                'attn_mask': enc['attention_mask']}
+
     if args.use_synthetic:
         print("  Using synthetic data (no download needed)")
-        def collate(batch):
-            images, captions = zip(*batch)
-            images = torch.stack(images)
-            enc = tokenizer(list(captions), padding='max_length', truncation=True,
-                          max_length=args.max_text_len, return_tensors='pt')
-            return images, enc['input_ids'], enc['attention_mask']
-        train_ds = SyntheticDataset(num_samples=args.train_size, image_size=args.image_size)
-        val_ds   = SyntheticDataset(num_samples=args.val_size, image_size=args.image_size, seed=99)
-        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size,
-                            shuffle=True, collate_fn=collate, num_workers=0)
-        val_loader   = torch.utils.data.DataLoader(val_ds, batch_size=args.batch_size,
-                            shuffle=False, collate_fn=collate, num_workers=0)
+        train_ds_img = SyntheticDataset(
+            num_samples=args.train_size, image_size=args.image_size)
+        val_ds_img = SyntheticDataset(
+            num_samples=args.val_size, image_size=args.image_size, seed=99)
+
+        train_loader_img = torch.utils.data.DataLoader(
+            train_ds_img, batch_size=args.batch_size,
+            shuffle=True, collate_fn=image_collate, num_workers=0)
+        val_loader_img = torch.utils.data.DataLoader(
+            val_ds_img, batch_size=args.batch_size,
+            shuffle=False, collate_fn=image_collate, num_workers=0)
+
+        train_loader = train_loader_img
+        val_loader = val_loader_img
     else:
-        data_config = {
-            "train_size": args.train_size,
-            "val_size": args.val_size,
-            "batch_size": args.batch_size,
-            "image_size": args.image_size,
-            "max_text_len": args.max_text_len,
-        }
+        data_config = {"train_size": args.train_size, "val_size": args.val_size,
+                       "batch_size": args.batch_size, "image_size": args.image_size,
+                       "max_text_len": args.max_text_len}
         train_loader, val_loader = build_loaders(tokenizer, data_config)
+
+    # Audio data
+    if args.use_audio:
+        def audio_collate(batch):
+            mels, captions = zip(*batch)
+            mels = torch.stack(mels)
+            enc = tokenizer(list(captions), padding='max_length', truncation=True,
+                            max_length=args.max_text_len, return_tensors='pt')
+            return {'audios': mels, 'text_ids': enc['input_ids'],
+                    'attn_mask': enc['attention_mask']}
+
+        train_ds_aud = AudioDataset(num_samples=args.aud_train_size)
+        val_ds_aud = AudioDataset(num_samples=args.aud_val_size, seed=99)
+        train_loader_aud = torch.utils.data.DataLoader(
+            train_ds_aud, batch_size=args.batch_size,
+            shuffle=True, collate_fn=audio_collate, num_workers=0)
+        val_loader_aud = torch.utils.data.DataLoader(
+            val_ds_aud, batch_size=args.batch_size,
+            shuffle=False, collate_fn=audio_collate, num_workers=0)
 
     # ── Optimizer ──
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.1, betas=(0.9, 0.95))
@@ -208,17 +206,7 @@ def train():
     cosine_sch = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
     scheduler = SequentialLR(optimizer, [warmup_sch, cosine_sch], milestones=[warmup_steps])
 
-    # ── Resume optimizer state ──
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location='cpu')
-        if 'optimizer_state_dict' in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                print("  Optimizer state restored")
-            except Exception as e:
-                print(f"  Optimizer state NOT restored ({e})")
-
-    # ── Prepare output dirs ──
+    # ── Output dirs ──
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     log_dir = Path(args.log_dir)
@@ -231,43 +219,53 @@ def train():
         json.dump(config_dict, f, indent=2)
 
     # ── Training ──
-    phase_tag = "Phase 2 (text+img gen)" if args.img_gen else "Phase 1 (text only)"
     print(f"\n{'='*60}")
-    print(f"{phase_tag}: {args.epochs} epochs, {args.train_size} samples")
+    print(f"{phase}: {args.epochs} epochs, {args.train_size} samples")
     print(f"  Steps/epoch: {len(train_loader)}, Batch: {args.batch_size}")
-    if args.img_gen:
-        print(f"  Image loss weight: {args.img_loss_weight}")
     print(f"{'='*60}\n")
 
     global_step = 0
     metrics = []
 
-    use_img_gen = args.img_gen
-
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        epoch_loss_text = 0.0
-        epoch_loss_img = 0.0
+        epoch_losses = {}
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
 
-        for images, text_ids, attn_mask in pbar:
-            images, text_ids, attn_mask = images.to(device), text_ids.to(device), attn_mask.to(device)
+        for batch in pbar:
+            text_ids = batch['text_ids'].to(device)
+            attn_mask = batch['attn_mask'].to(device)
+            images = batch.get('images', None)
+            if images is not None:
+                images = images.to(device)
+            audios = batch.get('audios', None)
+            if audios is not None:
+                audios = audios.to(device)
 
-            # Forward with optional image reconstruction
-            if use_img_gen:
-                logits, img_recon, target_patches = model(text_ids, images, return_img=True)
-                loss_text = compute_text_loss(logits, text_ids, attn_mask)
-                loss_img = compute_image_loss(img_recon, target_patches)
-                loss = loss_text + args.img_loss_weight * loss_img
-                epoch_loss_text += loss_text.item()
-                epoch_loss_img += loss_img.item()
-                loss_str = f"txt={loss_text.item():.4f} img={loss_img.item():.4f}"
-            else:
-                logits = model(text_ids, images, return_img=False)
-                loss_text = compute_text_loss(logits, text_ids, attn_mask)
-                loss = loss_text
-                epoch_loss_text += loss_text.item()
-                loss_str = f"loss={loss_text.item():.4f}"
+            # Forward
+            return_img = images is not None and args.img_gen
+            return_audio = audios is not None and args.use_audio
+
+            out = model(text_ids, images=images, audios=audios,
+                        return_img=return_img, return_audio=return_audio)
+
+            text_logits = out if isinstance(out, torch.Tensor) else out['text_logits']
+            loss = compute_text_loss(text_logits, text_ids, attn_mask)
+            epoch_losses['text'] = epoch_losses.get('text', 0) + loss.item()
+
+            loss_str = f"txt={loss.item():.4f}"
+
+            if return_img and 'img_recon' in out:
+                loss_img = compute_mse_loss(out['img_recon'], out['target_img'])
+                loss = loss + args.img_loss_weight * loss_img
+                epoch_losses['img'] = epoch_losses.get('img', 0) + loss_img.item()
+                loss_str += f" img={loss_img.item():.4f}"
+
+            if return_audio and 'aud_recon' in out:
+                loss_aud = compute_mse_loss(out['aud_recon'], out['target_aud'])
+                loss = loss + args.aud_loss_weight * loss_aud
+                epoch_losses['aud'] = epoch_losses.get('aud', 0) + loss_aud.item()
+                loss_str += f" aud={loss_aud.item():.4f}"
 
             optimizer.zero_grad()
             loss.backward()
@@ -279,88 +277,90 @@ def train():
             lr_val = scheduler.get_last_lr()[0]
             pbar.set_postfix_str(f"{loss_str} lr={lr_val:.2e}")
 
-        avg_text_loss = epoch_loss_text / len(train_loader)
-        if use_img_gen:
-            avg_img_loss = epoch_loss_img / len(train_loader)
-            print(f"\n  Epoch {epoch+1}: text_loss={avg_text_loss:.4f}, img_loss={avg_img_loss:.4f}")
-        else:
-            print(f"\n  Epoch {epoch+1}: train_loss={avg_text_loss:.4f}")
-
         # ── Validation ──
         model.eval()
-        val_text_loss = 0.0
-        val_img_loss = 0.0
+        val_losses = {}
         with torch.no_grad():
-            for images, text_ids, attn_mask in val_loader:
-                images, text_ids, attn_mask = images.to(device), text_ids.to(device), attn_mask.to(device)
-                if use_img_gen:
-                    logits, img_recon, target_patches = model(text_ids, images, return_img=True)
-                    val_text_loss += compute_text_loss(logits, text_ids, attn_mask).item()
-                    val_img_loss += compute_image_loss(img_recon, target_patches).item()
-                else:
-                    logits = model(text_ids, images)
-                    val_text_loss += compute_text_loss(logits, text_ids, attn_mask).item()
+            for batch in val_loader:
+                text_ids = batch['text_ids'].to(device)
+                attn_mask = batch['attn_mask'].to(device)
+                images = batch.get('images', None)
+                if images is not None: images = images.to(device)
+                audios = batch.get('audios', None)
+                if audios is not None: audios = audios.to(device)
 
-        val_text_loss /= len(val_loader)
-        if use_img_gen:
-            val_img_loss /= len(val_loader)
-            print(f"  Val: text_loss={val_text_loss:.4f}, img_loss={val_img_loss:.4f}")
-        else:
-            print(f"  Val: loss={val_text_loss:.4f}")
+                return_img = images is not None and args.img_gen
+                return_audio = audios is not None and args.use_audio
 
-        # Combined validation metric for best checkpoint tracking
-        combined_val = val_text_loss + (args.img_loss_weight * val_img_loss if use_img_gen else 0)
+                out = model(text_ids, images=images, audios=audios,
+                            return_img=return_img, return_audio=return_audio)
+                text_logits = out if isinstance(out, torch.Tensor) else out['text_logits']
+                vl = compute_text_loss(text_logits, text_ids, attn_mask).item()
+                val_losses['text'] = val_losses.get('text', 0) + vl
+
+                if return_img and 'img_recon' in out:
+                    val_losses['img'] = val_losses.get('img', 0) + \
+                        compute_mse_loss(out['img_recon'], out['target_img']).item()
+                if return_audio and 'aud_recon' in out:
+                    val_losses['aud'] = val_losses.get('aud', 0) + \
+                        compute_mse_loss(out['aud_recon'], out['target_aud']).item()
+
+        # Average
+        for k in val_losses:
+            val_losses[k] /= len(val_loader)
+
+        result_str = f"  Epoch {epoch+1}: "
+        for k in ['text', 'img', 'aud']:
+            if k in epoch_losses:
+                epoch_losses[k] /= len(train_loader)
+                result_str += f"{k}={epoch_losses[k]:.4f}({val_losses.get(k,0):.4f}) "
+
+        print(result_str)
 
         # ── Sample generation ──
-        if (epoch + 1) % max(1, args.save_every) == 0 and len(val_loader.dataset) > 0:
-            sample_img, sample_caption = val_loader.dataset[0]
-            sample_img_t = sample_img.to(device)
+        if (epoch + 1) % args.save_every == 0 and not args.use_audio:
+            if len(train_loader.dataset) > 0:
+                sample_img, sample_caption = train_loader.dataset[0]
+                sample_img_t = sample_img.unsqueeze(0).to(device)
+                gen_caption = model.generate_text(sample_img_t, tokenizer, max_len=30,
+                                                   temperature=0.8)
+                print(f"  GT: {sample_caption[:60]}")
+                print(f"  Gen: {gen_caption[:60]}")
 
-            # Generate text
-            gen_caption = model.generate_text(sample_img_t, tokenizer, max_len=30, temperature=0.8)
-            print(f"  Ground truth: {sample_caption[:80]}")
-            print(f"  Generated:    {gen_caption[:80]}")
-
-            # Image reconstruction quality
-            if use_img_gen:
-                recon_img = model.reconstruct_image(sample_img_t)
-                recon_mse = F.mse_loss(recon_img, sample_img_t).item()
-                print(f"  Recon MSE: {recon_mse:.6f}")
+        # ── Combined validation metric ──
+        combined = val_losses.get('text', 0) + \
+                   args.img_loss_weight * val_losses.get('img', 0) + \
+                   args.aud_loss_weight * val_losses.get('aud', 0)
 
         # ── Save checkpoint ──
-        if (epoch + 1) % args.save_every == 0 or combined_val < best_loss:
-            is_best = combined_val < best_loss
+        if (epoch + 1) % args.save_every == 0 or combined < best_loss:
+            is_best = combined < best_loss
             if is_best:
-                best_loss = combined_val
+                best_loss = combined
 
             ckpt_path = output_dir / f"epoch_{epoch+1}.pt"
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_text_loss': avg_text_loss,
-                'train_img_loss': avg_img_loss if use_img_gen else None,
-                'val_text_loss': val_text_loss,
-                'val_img_loss': val_img_loss if use_img_gen else None,
-                'best_loss': best_loss,
-                'phase': 2 if use_img_gen else 1,
-            }, ckpt_path)
+            save_dict = {'epoch': epoch, 'model_state_dict': model.state_dict(),
+                         'optimizer_state_dict': optimizer.state_dict(),
+                         'best_loss': best_loss, 'phase': 3 if args.use_audio else 2}
+            for k in ['text', 'img', 'aud']:
+                if k in val_losses:
+                    save_dict[f'val_{k}_loss'] = val_losses[k]
+                if k in epoch_losses:
+                    save_dict[f'train_{k}_loss'] = epoch_losses[k]
+            torch.save(save_dict, ckpt_path)
 
             if is_best:
                 best_path = output_dir / "best.pt"
                 torch.save(model.state_dict(), best_path)
-                print(f"  \u2713 New best (combined: {combined_val:.4f})")
+                print(f"  \u2713 New best (combined: {combined:.4f})")
 
         # ── Log ──
-        log_entry = {
-            'epoch': epoch + 1,
-            'train_text_loss': avg_text_loss,
-            'val_text_loss': val_text_loss,
-            'lr': scheduler.get_last_lr()[0],
-        }
-        if use_img_gen:
-            log_entry['train_img_loss'] = avg_img_loss
-            log_entry['val_img_loss'] = val_img_loss
+        log_entry = {'epoch': epoch + 1, 'lr': scheduler.get_last_lr()[0]}
+        for k in ['text', 'img', 'aud']:
+            if k in epoch_losses:
+                log_entry[f'train_{k}_loss'] = epoch_losses[k]
+            if k in val_losses:
+                log_entry[f'val_{k}_loss'] = val_losses[k]
         metrics.append(log_entry)
         with open(log_dir / "metrics.json", 'w') as f:
             json.dump(metrics, f, indent=2)
@@ -368,7 +368,6 @@ def train():
     print(f"\n{'='*60}")
     print(f"Training complete! Best loss: {best_loss:.4f}")
     print(f"Checkpoints: {output_dir.resolve()}")
-    print(f"Logs: {log_dir.resolve()}")
     print(f"{'='*60}")
 
 
