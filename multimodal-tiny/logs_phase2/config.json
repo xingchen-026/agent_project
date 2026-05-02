@@ -1,0 +1,21 @@
+{
+  "epochs": 10,
+  "batch_size": 32,
+  "train_size": 10000,
+  "val_size": 500,
+  "max_text_len": 48,
+  "use_synthetic": true,
+  "dim": 384,
+  "layers": 6,
+  "image_size": 224,
+  "patch_size": 32,
+  "img_gen": true,
+  "img_loss_weight": 1.0,
+  "img_decoder_hidden": 512,
+  "lr": 0.0003,
+  "save_every": 2,
+  "output_dir": "checkpoints_phase2",
+  "log_dir": "logs_phase2",
+  "resume": "checkpoints/best.pt",
+  "model_params_m": 17.563136
+}
