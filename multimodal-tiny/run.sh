@@ -6,17 +6,8 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Use shared mvp-venv
-VENV="$(dirname "$SCRIPT_DIR")/../mvp-venv"
-if [ ! -f "$VENV/bin/python3" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv "$VENV"
-fi
-source "$VENV/bin/activate"
-
-# Quick dep check
-python3 -c "import torch" 2>/dev/null || pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu -q
-python3 -c "import tqdm" 2>/dev/null || pip install tqdm -q
+VENV="$SCRIPT_DIR/../.venv"
+source "$VENV/Scripts/activate"
 
 echo "=== Tiny Multimodal Phase 2 Training ==="
 echo ""

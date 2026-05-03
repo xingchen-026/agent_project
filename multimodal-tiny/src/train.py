@@ -23,6 +23,7 @@ from model import TinyMultimodal, ModelConfig, patches_to_image, mel_patches_to_
 from data import build_loaders
 from synthetic_data import SyntheticDataset
 from audio_synthetic import AudioDataset, get_audio_tokenizer_description
+from video_synthetic import VideoDataset
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -57,6 +58,13 @@ def get_args():
     parser.add_argument("--aud_train_size", type=int, default=5000)
     parser.add_argument("--aud_val_size", type=int, default=200)
 
+    # Phase 4: Video
+    parser.add_argument("--use_video", action='store_true',
+                        help="Enable video modality training")
+    parser.add_argument("--vid_loss_weight", type=float, default=0.5)
+    parser.add_argument("--vid_train_size", type=int, default=3000)
+    parser.add_argument("--vid_val_size", type=int, default=100)
+
     # Training
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--save_every", type=int, default=2)
@@ -87,13 +95,16 @@ def load_checkpoint_flexible(model, checkpoint_path, device='cpu'):
 
     model_dict = model.state_dict()
     loaded = 0
+    skipped = 0
     for key in state_dict:
         if key in model_dict and state_dict[key].shape == model_dict[key].shape:
             model_dict[key] = state_dict[key]
             loaded += 1
+        else:
+            skipped += 1
 
-    model.load_state_dict(model_dict, strict=True)
-    print(f"  ✓ Loaded {loaded}/{len(model_dict)} keys")
+    model.load_state_dict(model_dict, strict=False)
+    print(f"  ✓ Loaded {loaded}/{len(model_dict)} keys ({skipped} skipped - new layers)")
 
     info = {}
     if 'epoch' in ckpt:
@@ -105,7 +116,8 @@ def train():
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    phase = "Phase 3 (text+img+audio)" if args.use_audio else \
+    phase = "Phase 4 (text+img+audio+video)" if args.use_video else \
+            "Phase 3 (text+img+audio)" if args.use_audio else \
             "Phase 2 (text+img gen)" if args.img_gen else \
             "Phase 1 (text only)"
     print(f"Mode: {phase}")
@@ -125,6 +137,7 @@ def train():
         img_generation=args.img_gen,
         img_decoder_hidden=args.img_decoder_hidden,
         use_audio=args.use_audio,
+        use_video=args.use_video,
     )
 
     # ── Model ──
@@ -179,6 +192,25 @@ def train():
                        "max_text_len": args.max_text_len}
         train_loader, val_loader = build_loaders(tokenizer, data_config)
 
+    # ── Video data ──
+    if args.use_video:
+        def video_collate(batch):
+            videos, captions = zip(*batch)
+            videos = torch.stack(videos)
+            enc = tokenizer(list(captions), padding='max_length', truncation=True,
+                            max_length=args.max_text_len, return_tensors='pt')
+            return {'videos': videos, 'text_ids': enc['input_ids'],
+                    'attn_mask': enc['attention_mask']}
+
+        train_ds_vid = VideoDataset(num_samples=args.vid_train_size)
+        val_ds_vid = VideoDataset(num_samples=args.vid_val_size, seed=99)
+        train_loader_vid = torch.utils.data.DataLoader(
+            train_ds_vid, batch_size=args.batch_size,
+            shuffle=True, collate_fn=video_collate, num_workers=0)
+        val_loader_vid = torch.utils.data.DataLoader(
+            val_ds_vid, batch_size=args.batch_size,
+            shuffle=False, collate_fn=video_collate, num_workers=0)
+
     # Audio data
     if args.use_audio:
         def audio_collate(batch):
@@ -197,6 +229,38 @@ def train():
         val_loader_aud = torch.utils.data.DataLoader(
             val_ds_aud, batch_size=args.batch_size,
             shuffle=False, collate_fn=audio_collate, num_workers=0)
+
+    # ── Interleave loaders ──
+    loaders_to_interleave = [train_loader_img, val_loader_img]
+    loaders_val_to_interleave = [val_loader_img]
+    loader_labels = ['img']
+
+    if args.use_audio:
+        loaders_to_interleave.append(train_loader_aud)
+        loaders_val_to_interleave.append(val_loader_aud)
+        loader_labels.append('aud')
+    if args.use_video:
+        loaders_to_interleave.append(train_loader_vid)
+        loaders_val_to_interleave.append(val_loader_vid)
+        loader_labels.append('vid')
+
+    if len(loaders_to_interleave) > 1:
+        def interleave(*loaders):
+            """Alternate batches from multiple loaders (one from each round-robin)."""
+            its = [iter(l) for l in loaders]
+            done = [False] * len(its)
+            while not all(done):
+                for i, it in enumerate(its):
+                    if not done[i]:
+                        try:
+                            yield next(it)
+                        except StopIteration:
+                            done[i] = True
+        train_loader = list(interleave(*loaders_to_interleave))
+        val_loader = list(interleave(*loaders_val_to_interleave))
+        sizes = [len(l) for l in loaders_to_interleave]
+        print(f"  Combined: {len(train_loader)} train batches "
+              f"({' + '.join(f'{s} {lbl}' for s, lbl in zip(sizes, loader_labels))})")
 
     # ── Optimizer ──
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.1, betas=(0.9, 0.95))
@@ -220,7 +284,13 @@ def train():
 
     # ── Training ──
     print(f"\n{'='*60}")
-    print(f"{phase}: {args.epochs} epochs, {args.train_size} samples")
+    print(f"{phase}: {args.epochs} epochs")
+    if args.use_video:
+        print(f"  Img samples: {args.train_size}, Aud samples: {args.aud_train_size}, Vid samples: {args.vid_train_size}")
+    elif args.use_audio:
+        print(f"  Img samples: {args.train_size}, Aud samples: {args.aud_train_size}")
+    else:
+        print(f"  Train samples: {args.train_size}")
     print(f"  Steps/epoch: {len(train_loader)}, Batch: {args.batch_size}")
     print(f"{'='*60}\n")
 
@@ -230,6 +300,7 @@ def train():
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_losses = {}
+        train_counts = {'text': 0}
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
 
         for batch in pbar:
@@ -241,17 +312,23 @@ def train():
             audios = batch.get('audios', None)
             if audios is not None:
                 audios = audios.to(device)
+            videos = batch.get('videos', None)
+            if videos is not None:
+                videos = videos.to(device)
 
             # Forward
             return_img = images is not None and args.img_gen
             return_audio = audios is not None and args.use_audio
+            return_video = videos is not None and args.use_video
 
-            out = model(text_ids, images=images, audios=audios,
-                        return_img=return_img, return_audio=return_audio)
+            out = model(text_ids, images=images, audios=audios, videos=videos,
+                        return_img=return_img, return_audio=return_audio,
+                        return_video=return_video)
 
             text_logits = out if isinstance(out, torch.Tensor) else out['text_logits']
             loss = compute_text_loss(text_logits, text_ids, attn_mask)
             epoch_losses['text'] = epoch_losses.get('text', 0) + loss.item()
+            train_counts['text'] += 1
 
             loss_str = f"txt={loss.item():.4f}"
 
@@ -259,13 +336,22 @@ def train():
                 loss_img = compute_mse_loss(out['img_recon'], out['target_img'])
                 loss = loss + args.img_loss_weight * loss_img
                 epoch_losses['img'] = epoch_losses.get('img', 0) + loss_img.item()
+                train_counts['img'] = train_counts.get('img', 0) + 1
                 loss_str += f" img={loss_img.item():.4f}"
 
             if return_audio and 'aud_recon' in out:
                 loss_aud = compute_mse_loss(out['aud_recon'], out['target_aud'])
                 loss = loss + args.aud_loss_weight * loss_aud
                 epoch_losses['aud'] = epoch_losses.get('aud', 0) + loss_aud.item()
+                train_counts['aud'] = train_counts.get('aud', 0) + 1
                 loss_str += f" aud={loss_aud.item():.4f}"
+
+            if return_video and 'vid_recon' in out:
+                loss_vid = compute_mse_loss(out['vid_recon'], out['target_vid'])
+                loss = loss + args.vid_loss_weight * loss_vid
+                epoch_losses['vid'] = epoch_losses.get('vid', 0) + loss_vid.item()
+                train_counts['vid'] = train_counts.get('vid', 0) + 1
+                loss_str += f" vid={loss_vid.item():.4f}"
 
             optimizer.zero_grad()
             loss.backward()
@@ -280,6 +366,7 @@ def train():
         # ── Validation ──
         model.eval()
         val_losses = {}
+        val_counts = {'text': 0}
         with torch.no_grad():
             for batch in val_loader:
                 text_ids = batch['text_ids'].to(device)
@@ -288,49 +375,61 @@ def train():
                 if images is not None: images = images.to(device)
                 audios = batch.get('audios', None)
                 if audios is not None: audios = audios.to(device)
+                videos = batch.get('videos', None)
+                if videos is not None: videos = videos.to(device)
 
                 return_img = images is not None and args.img_gen
                 return_audio = audios is not None and args.use_audio
+                return_video = videos is not None and args.use_video
 
-                out = model(text_ids, images=images, audios=audios,
-                            return_img=return_img, return_audio=return_audio)
+                out = model(text_ids, images=images, audios=audios, videos=videos,
+                            return_img=return_img, return_audio=return_audio,
+                            return_video=return_video)
                 text_logits = out if isinstance(out, torch.Tensor) else out['text_logits']
                 vl = compute_text_loss(text_logits, text_ids, attn_mask).item()
                 val_losses['text'] = val_losses.get('text', 0) + vl
+                val_counts['text'] += 1
 
                 if return_img and 'img_recon' in out:
                     val_losses['img'] = val_losses.get('img', 0) + \
                         compute_mse_loss(out['img_recon'], out['target_img']).item()
+                    val_counts['img'] = val_counts.get('img', 0) + 1
                 if return_audio and 'aud_recon' in out:
                     val_losses['aud'] = val_losses.get('aud', 0) + \
                         compute_mse_loss(out['aud_recon'], out['target_aud']).item()
+                    val_counts['aud'] = val_counts.get('aud', 0) + 1
+                if return_video and 'vid_recon' in out:
+                    val_losses['vid'] = val_losses.get('vid', 0) + \
+                        compute_mse_loss(out['vid_recon'], out['target_vid']).item()
+                    val_counts['vid'] = val_counts.get('vid', 0) + 1
 
-        # Average
+        # Average (by modality count, not total batches)
         for k in val_losses:
-            val_losses[k] /= len(val_loader)
+            val_losses[k] /= max(val_counts.get(k, 1), 1)
 
         result_str = f"  Epoch {epoch+1}: "
-        for k in ['text', 'img', 'aud']:
+        for k in ['text', 'img', 'aud', 'vid']:
             if k in epoch_losses:
-                epoch_losses[k] /= len(train_loader)
+                epoch_losses[k] /= max(train_counts.get(k, 1), 1)
                 result_str += f"{k}={epoch_losses[k]:.4f}({val_losses.get(k,0):.4f}) "
 
         print(result_str)
 
-        # ── Sample generation ──
-        if (epoch + 1) % args.save_every == 0 and not args.use_audio:
-            if len(train_loader.dataset) > 0:
-                sample_img, sample_caption = train_loader.dataset[0]
+        # ── Sample generation (from image) ──
+        if (epoch + 1) % args.save_every == 0:
+            if hasattr(train_loader_img, 'dataset') and len(train_loader_img.dataset) > 0:
+                sample_img, sample_caption = train_loader_img.dataset[0]
                 sample_img_t = sample_img.unsqueeze(0).to(device)
                 gen_caption = model.generate_text(sample_img_t, tokenizer, max_len=30,
                                                    temperature=0.8)
-                print(f"  GT: {sample_caption[:60]}")
-                print(f"  Gen: {gen_caption[:60]}")
+                print(f"  Img→Txt GT: {sample_caption[:60]}")
+                print(f"  Img→Txt Gen: {gen_caption[:60]}")
 
         # ── Combined validation metric ──
         combined = val_losses.get('text', 0) + \
                    args.img_loss_weight * val_losses.get('img', 0) + \
-                   args.aud_loss_weight * val_losses.get('aud', 0)
+                   args.aud_loss_weight * val_losses.get('aud', 0) + \
+                   args.vid_loss_weight * val_losses.get('vid', 0)
 
         # ── Save checkpoint ──
         if (epoch + 1) % args.save_every == 0 or combined < best_loss:
@@ -342,7 +441,7 @@ def train():
             save_dict = {'epoch': epoch, 'model_state_dict': model.state_dict(),
                          'optimizer_state_dict': optimizer.state_dict(),
                          'best_loss': best_loss, 'phase': 3 if args.use_audio else 2}
-            for k in ['text', 'img', 'aud']:
+            for k in ['text', 'img', 'aud', 'vid']:
                 if k in val_losses:
                     save_dict[f'val_{k}_loss'] = val_losses[k]
                 if k in epoch_losses:
@@ -356,7 +455,7 @@ def train():
 
         # ── Log ──
         log_entry = {'epoch': epoch + 1, 'lr': scheduler.get_last_lr()[0]}
-        for k in ['text', 'img', 'aud']:
+        for k in ['text', 'img', 'aud', 'vid']:
             if k in epoch_losses:
                 log_entry[f'train_{k}_loss'] = epoch_losses[k]
             if k in val_losses:

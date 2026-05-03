@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Tiny Unified Multimodal Transformer — v3.0 (Phase 3: Audio Modality)
+Tiny Unified Multimodal Transformer — v4.0 (Phase 4: Video Modality)
 =====================================================================
-Phase 3 adds audio spectrogram patch processing alongside image+text.
+Phase 4 adds spatiotemporal video patch processing alongside image+audio+text.
 
 Architecture:
-  [image_patches | audio_patches | text_tokens] → Transformer → outputs
+  [video_tokens | image_tokens | audio_patches | text_tokens] → Transformer → outputs
 """
 
 import math
@@ -53,12 +53,23 @@ class ModelConfig:
     audio_patch_freq: int = 16
     audio_patch_time: int = 16
 
+    # --- Phase 4: Video Modality ---
+    use_video: bool = True
+    video_frames: int = 4        # Number of frames per clip
+    video_resolution: int = 64   # H=W per frame
+    video_patch_size: int = 16   # Spatial patch (H,W)
+    video_patch_time: int = 2    # Temporal patch (frames)
+
     def __post_init__(self):
         self.head_dim = self.dim // self.n_heads
         patches_per_side = self.image_size // self.patch_size
         self.num_image_tokens = patches_per_side * patches_per_side
         self.num_audio_tokens = (self.n_mels // self.audio_patch_freq) * \
                                 (self.audio_time_frames // self.audio_patch_time)
+        if self.use_video:
+            vfr = self.video_frames // self.video_patch_time
+            vsp = self.video_resolution // self.video_patch_size
+            self.num_video_tokens = vfr * vsp * vsp
 
 
 # ── Common Components ────────────────────────────────────────────────
@@ -173,6 +184,22 @@ class AudioDecoderHead(nn.Module):
         return self.net(hidden_states)
 
 
+class VideoDecoderHead(nn.Module):
+    """Reconstruct video spatiotemporal patches from hidden states."""
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        # Each patch: 3 RGB channels x patch_size x patch_size x patch_time
+        patch_pixels = 3 * cfg.video_patch_size * cfg.video_patch_size * cfg.video_patch_time
+        self.net = nn.Sequential(
+            nn.Linear(cfg.dim, cfg.dim // 2),
+            nn.GELU(),
+            nn.Linear(cfg.dim // 2, patch_pixels),
+        )
+
+    def forward(self, hidden_states):
+        return self.net(hidden_states)
+
+
 # ── Utility ──────────────────────────────────────────────────────────
 
 def patches_to_image(patches, patch_size, image_size):
@@ -188,23 +215,49 @@ def patches_to_image(patches, patch_size, image_size):
         return patches  # return raw if reshape fails
 
 
-def mel_patches_to_spectrogram(patches, cfg):
-    """Rebuild mel spectrogram from patches: [B, N, F*T] → [B, 1, n_mels, time_frames]."""
+def mel_patches_to_spectrogram(patches, cfg, n_time_patches=None, n_time_total=None):
+    """
+    Rebuild mel spectrogram from patches: [B, N, F*T] → [B, 1, n_mels, time_frames].
+    
+    If n_time_patches/n_time_total are provided, use actual audio dimensions
+    instead of config defaults (handles variable-length audio).
+    """
     n_freq_patches = cfg.n_mels // cfg.audio_patch_freq
-    n_time_patches = cfg.audio_time_frames // cfg.audio_patch_time
+    n_time = n_time_patches if n_time_patches is not None else (cfg.audio_time_frames // cfg.audio_patch_time)
+    time_total = n_time_total if n_time_total is not None else cfg.audio_time_frames
     pf, pt = cfg.audio_patch_freq, cfg.audio_patch_time
-    spec = patches.reshape(-1, n_freq_patches, n_time_patches, pf, pt)
-    spec = spec.permute(0, 1, 3, 2, 4).reshape(-1, 1, cfg.n_mels, cfg.audio_time_frames)
+    spec = patches.reshape(-1, n_freq_patches, n_time, pf, pt)
+    spec = spec.permute(0, 1, 3, 2, 4).reshape(-1, 1, cfg.n_mels, time_total)
     return spec
+
+
+def video_patches_to_frames(patches, cfg):
+    """
+    Rebuild video frames from spatiotemporal patches.
+    patches: [B, N, C*ps*ps*pt] → [B, 3, T, H, W]
+    """
+    B = patches.shape[0]
+    pt = cfg.video_patch_time
+    ps = cfg.video_patch_size
+    n_t = cfg.video_frames // pt
+    n_h = n_w = cfg.video_resolution // ps
+    C = 3
+    # [B, n_t, n_h, n_w, C, pt, ps, ps]
+    patches_3d = patches.reshape(B, n_t, n_h, n_w, C, pt, ps, ps)
+    # [B, C, n_t, pt, n_h, ps, n_w, ps]
+    patches_3d = patches_3d.permute(0, 4, 1, 5, 2, 6, 3, 7)
+    # [B, C, n_t*pt, n_h*ps, n_w*ps] = [B, 3, T, H, W]
+    frames = patches_3d.reshape(B, C, cfg.video_frames, cfg.video_resolution, cfg.video_resolution)
+    return frames
 
 
 # ── Unified Model v3.0 ──────────────────────────────────────────────
 
 class TinyMultimodal(nn.Module):
     """
-    Tiny unified multimodal transformer — supports image + audio + text.
-    Token order: [image_patches | audio_patches | text_tokens]
-    Attention: image↔audio all-to-all, text causal (attends to all modalities)
+    Tiny unified multimodal transformer — supports video + image + audio + text.
+    Token order: [video_tokens | image_tokens | audio_patches | text_tokens]
+    Attention: video↔image↔audio all-to-all, text causal (attends to all modalities)
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -225,15 +278,26 @@ class TinyMultimodal(nn.Module):
             self.audio_norm = RMSNorm(cfg.dim)
             self.audio_decoder = AudioDecoderHead(cfg)
 
+        # Video projection: spatiotemporal patches (C*ps*ps*pt)
+        if cfg.use_video:
+            vid_patch_pixels = 3 * cfg.video_patch_size * cfg.video_patch_size * cfg.video_patch_time
+            self.video_proj = nn.Linear(vid_patch_pixels, cfg.dim)
+            self.video_norm = RMSNorm(cfg.dim)
+            self.video_decoder = VideoDecoderHead(cfg)
+
         # Placeholder tokens for text-to-modality generation
         if cfg.img_generation:
             self.img_placeholder = nn.Parameter(torch.randn(1, 1, cfg.dim) * 0.02)
         if cfg.use_audio:
             self.audio_placeholder = nn.Parameter(torch.randn(1, 1, cfg.dim) * 0.02)
+        if cfg.use_video:
+            self.video_placeholder = nn.Parameter(torch.randn(1, 1, cfg.dim) * 0.02)
 
-        # Type embedding: 0=text, 1=image, 2=audio, 3=img_placeholder, 4=audio_placeholder
+        # Type embedding: 0=text, 1=image, 2=audio, 3=img_placeholder, 4=audio_placeholder, 5=video, 6=video_placeholder
         if cfg.use_type_embed:
-            n_types = 5 if cfg.use_audio else 3
+            n_types = 7 if (cfg.use_audio and cfg.use_video) else (
+                        6 if cfg.use_video else (
+                        5 if cfg.use_audio else 3))
             self.type_embed = nn.Embedding(n_types, cfg.dim)
 
         # Transformer
@@ -265,12 +329,21 @@ class TinyMultimodal(nn.Module):
 
     def get_num_audio_tokens(self, mels=None):
         if mels is not None:
-            # Actual number from mel spectrogram dimensions
             H, W = mels.shape[-2], mels.shape[-1]
             pf, pt = self.cfg.audio_patch_freq, self.cfg.audio_patch_time
             return (H // pf) * (W // pt)
         return (self.cfg.n_mels // self.cfg.audio_patch_freq) * \
                (self.cfg.audio_time_frames // self.cfg.audio_patch_time)
+
+    def get_num_video_tokens(self, videos=None):
+        if videos is not None:
+            # [B, 3, T, H, W]
+            C, T, H, W = videos.shape[1], videos.shape[2], videos.shape[3], videos.shape[4]
+            nt = T // self.cfg.video_patch_time
+            nh = H // self.cfg.video_patch_size
+            nw = W // self.cfg.video_patch_size
+            return nt * nh * nw
+        return self.cfg.num_video_tokens
 
     def _image_to_patches(self, images):
         B, C, H, W = images.shape
@@ -289,25 +362,40 @@ class TinyMultimodal(nn.Module):
         patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(B, -1, pf * pt)
         return patches
 
-    def _make_attention_mask(self, n_img, n_audio, total_len, device=None):
-        """Image↔Audio all-to-all, Text causal."""
+    def _video_to_patches(self, videos):
+        """
+        Convert [B, 3, T, H, W] video to [B, N, C*pt*ps*ps] spatiotemporal patches.
+        """
+        B, C, T, H, W = videos.shape
+        pt = self.cfg.video_patch_time
+        ps = self.cfg.video_patch_size
+        # unfold temporal, then spatial
+        patches = videos.unfold(2, pt, pt).unfold(3, ps, ps).unfold(4, ps, ps)
+        # [B, n_t, n_h, n_w, C, pt, ps, ps] → [B, N, C*pt*ps*ps]
+        patches = patches.permute(0, 2, 3, 4, 1, 5, 6, 7)
+        patches = patches.reshape(B, -1, C * pt * ps * ps)
+        return patches
+
+    def _make_attention_mask(self, n_video, n_img, n_audio, total_len, device=None):
+        """Video↔Image↔Audio all-to-all, Text causal."""
         mask = torch.full((total_len, total_len), float('-inf'), device=device)
-        end_sensory = n_img + n_audio
-        # Sensory region (image + audio): all-to-all
+        end_sensory = n_video + n_img + n_audio
+        # Sensory region: all-to-all
         mask[:end_sensory, :end_sensory] = 0
         # Text: causal + attend to all sensory
         for i in range(end_sensory, total_len):
             mask[i, :i + 1] = 0
         return mask
 
-    def forward(self, text_ids, images=None, audios=None,
-                return_img=False, return_audio=False,
+    def forward(self, text_ids, images=None, audios=None, videos=None,
+                return_img=False, return_audio=False, return_video=False,
                 img_gen_mode=False, audio_gen_mode=False):
         """
         Args:
             text_ids: [B, T]
             images: [B, 3, H, W] or None
             audios: [B, 1, n_mels, T] or None
+            videos: [B, 3, T, H, W] or None
         Returns:
             text_logits or (text_logits, recon_dict)
         """
@@ -317,6 +405,23 @@ class TinyMultimodal(nn.Module):
         target_patches = {}
         tokens_list = []
         type_ids_list = []
+
+        # ── Video tokens (first in sequence) ──
+        n_vid = 0
+        if self.cfg.use_video:
+            if videos is not None:
+                n_vid = self.get_num_video_tokens(videos)
+                vid_patches = self._video_to_patches(videos)
+                target_patches['video'] = vid_patches.detach()
+                vid_tokens = self.video_norm(self.video_proj(vid_patches))
+                vtype = torch.full((B, n_vid), 5, device=device, dtype=torch.long)
+            else:
+                n_vid = self.get_num_video_tokens()
+                vid_tokens = self.video_placeholder.expand(B, n_vid, -1)
+                vtype = torch.full((B, n_vid), 6, device=device, dtype=torch.long)
+                target_patches['video'] = None
+            tokens_list.append(vid_tokens)
+            type_ids_list.append(vtype)
 
         # ── Image tokens ──
         if img_gen_mode or images is None:
@@ -362,52 +467,59 @@ class TinyMultimodal(nn.Module):
 
         total_len = x.shape[1]
         cos, sin = self.rope(total_len, device)
-        mask = self._make_attention_mask(n_img, n_aud, total_len, device)
+        mask = self._make_attention_mask(n_vid, n_img, n_aud, total_len, device)
 
         for block in self.blocks:
             x = block(x, cos, sin)
         x = self.final_norm(x)
 
         # ── Text output ──
-        n_sensory = n_img + n_aud
+        n_sensory = n_vid + n_img + n_aud
         text_logits = self.lm_head(x[:, n_sensory:])
 
         # ── Reconstruction outputs ──
         results = {'text_logits': text_logits}
 
         if return_img and self.cfg.img_generation:
-            img_hidden = x[:, :n_img]
+            img_hidden = x[:, n_vid:n_vid + n_img]
             results['img_recon'] = self.img_decoder(img_hidden)
             results['target_img'] = target_patches.get('image')
 
         if return_audio and self.cfg.use_audio and n_aud > 0 and audios is not None:
-            aud_hidden = x[:, n_img:n_img + n_aud]
+            aud_hidden = x[:, n_vid + n_img:n_vid + n_img + n_aud]
             results['aud_recon'] = self.audio_decoder(aud_hidden)
             results['target_aud'] = target_patches.get('audio')
 
-        if return_img or return_audio:
+        if return_video and self.cfg.use_video and n_vid > 0 and videos is not None:
+            vid_hidden = x[:, :n_vid]
+            results['vid_recon'] = self.video_decoder(vid_hidden)
+            results['target_vid'] = target_patches.get('video')
+
+        if return_img or return_audio or return_video:
             return results
         return text_logits
 
     # ── Inference ──
 
     @torch.no_grad()
-    def generate_text(self, image, tokenizer, audio=None, max_len=50,
+    def generate_text(self, image, tokenizer, audio=None, video=None, max_len=50,
                       temperature=0.8, top_k=50):
-        """Generate text description from image (optionally + audio)."""
+        """Generate text description from image (optionally + audio/video)."""
         self.eval()
         device = next(self.parameters()).device
         if image is not None and image.dim() == 3:
             image = image.unsqueeze(0)
         if audio is not None and audio.dim() == 3:
             audio = audio.unsqueeze(0)
+        if video is not None and video.dim() == 4:
+            video = video.unsqueeze(0)
 
         bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
         text_ids = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
         generated = []
 
         for _ in range(max_len):
-            out = self(text_ids, images=image, audios=audio)
+            out = self(text_ids, images=image, audios=audio, videos=video)
             logits = out if isinstance(out, torch.Tensor) else out['text_logits']
             next_logits = logits[0, -1] / temperature
 
@@ -463,5 +575,26 @@ class TinyMultimodal(nn.Module):
         bos_id = 0
         text_ids = torch.full((audios.shape[0], 1), bos_id, dtype=torch.long, device=device)
         out = self(text_ids, audios=audios, return_audio=True)
-        spec = mel_patches_to_spectrogram(out['aud_recon'], self.cfg)
+        # Compute actual audio dimensions for flexible-length reconstruction
+        H, W = audios.shape[-2], audios.shape[-1]
+        pf, pt = self.cfg.audio_patch_freq, self.cfg.audio_patch_time
+        n_fp = H // pf
+        n_tp = W // pt
+        n_time_total = n_tp * pt
+        spec = mel_patches_to_spectrogram(out['aud_recon'], self.cfg,
+                                          n_time_patches=n_tp, n_time_total=n_time_total)
         return torch.clamp(spec, -1.0, 1.0)
+
+    @torch.no_grad()
+    def reconstruct_video(self, videos):
+        """Reconstruct video frames."""
+        self.eval()
+        device = next(self.parameters()).device
+        if videos.dim() == 4:
+            videos = videos.unsqueeze(0)
+        videos = videos.to(device)
+        bos_id = 0
+        text_ids = torch.full((videos.shape[0], 1), bos_id, dtype=torch.long, device=device)
+        out = self(text_ids, videos=videos, return_video=True)
+        frames = video_patches_to_frames(out['vid_recon'], self.cfg)
+        return torch.clamp(frames, -1.0, 1.0)

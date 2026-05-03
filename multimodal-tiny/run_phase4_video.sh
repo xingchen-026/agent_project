@@ -1,17 +1,16 @@
 #!/bin/bash
-# Run Tiny Multimodal Training on GPU — Phase 4 (text+img+audio+video)
+# Phase 4: Text + Image + Audio + Video training
+# Resumes from Phase 3a best checkpoint
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 source "$SCRIPT_DIR/../.venv/Scripts/activate"
 
-echo "=== GPU Training (Phase 4: Text+Img+Audio+Video) ==="
-python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}'); print(f'Mem: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f}GB')"
-
 python src/train.py \
-  --use_synthetic \
   --epochs 10 \
   --batch_size 24 \
+  --use_synthetic \
   --train_size 10000 \
   --val_size 500 \
   --use_audio \
@@ -25,5 +24,6 @@ python src/train.py \
   --img_loss_weight 0.5 \
   --output_dir checkpoints_phase4 \
   --log_dir logs_phase4 \
-  --resume checkpoints_phase3a/best.pt \
-  "$@"
+  --resume checkpoints_phase3a/best.pt
+
+echo "Phase 4 complete!"
