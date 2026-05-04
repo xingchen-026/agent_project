@@ -99,8 +99,24 @@ case "$PHASE" in
       --output_dir checkpoints_phase6 --log_dir logs_phase6 \
       "$@"
     ;;
+  phase6_cn)
+    echo "=== Phase 6 + COCO-CN: Real Chinese Image Fine-tuning ==="
+    export CUDA_VISIBLE_DEVICES=0
+    export PYTHONIOENCODING=utf-8
+    python src/finetune_coco_cn.py \
+      --resume checkpoints_phase6/best.pt --epochs 15 \
+      "$@"
+    ;;
+  phase6_vqa)
+    echo "=== Phase 6 + VQA: Chinese Instruction Tuning ==="
+    export CUDA_VISIBLE_DEVICES=0
+    export PYTHONIOENCODING=utf-8
+    python src/finetune_vqa.py \
+      --resume checkpoints_phase6_cn/best.pt --epochs 5 \
+      "$@"
+    ;;
   *)
-    echo "Usage: ./run.sh {phase2|phase3|phase4|phase4_5|phase5|phase5_v2|phase6} [extra args]"
+    echo "Usage: ./run.sh {phase2|...|phase6|phase6_cn|phase6_vqa} [extra args]"
     exit 1
     ;;
 esac

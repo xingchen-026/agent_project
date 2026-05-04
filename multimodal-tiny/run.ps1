@@ -92,7 +92,21 @@ switch ($Phase) {
       --output_dir checkpoints_phase6 --log_dir logs_phase6 `
       @ExtraArgs
   }
+  "phase6_cn" {
+    Write-Host "=== Phase 6 + COCO-CN: Real Chinese Image Fine-tuning ==="
+    $env:PYTHONIOENCODING = "utf-8"
+    python src/finetune_coco_cn.py `
+      --resume checkpoints_phase6/best.pt --epochs 15 `
+      @ExtraArgs
+  }
+  "phase6_vqa" {
+    Write-Host "=== Phase 6 + VQA: Chinese Instruction Tuning ==="
+    $env:PYTHONIOENCODING = "utf-8"
+    python src/finetune_vqa.py `
+      --resume checkpoints_phase6_cn/best.pt --epochs 5 `
+      @ExtraArgs
+  }
   default {
-    Write-Host "Usage: .\run.ps1 {phase2|phase3|phase4|phase4_5|phase5|phase5_v2|phase6} [extra args]"
+    Write-Host "Usage: .\run.ps1 {phase2|...|phase6|phase6_cn|phase6_vqa} [extra args]"
   }
 }
