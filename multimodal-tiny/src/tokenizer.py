@@ -42,9 +42,10 @@ class SimpleTokenizer:
         extra = list("为与对中时后前上说下里外画面片长宽")
         more = list("使用制作生成显示变化模式类型种条线面及边粒状块信号深出现消失")
         addn = list("两三个同带与由被旋转")
-        return list(set(punct + colors + shapes + move + desc + nums + sound + other + grammar + extra + more + addn))
-        return list(set(punct + colors + shapes + move + desc + nums + sound + other + grammar + extra + more))
-        return list(set(punct + colors + shapes + move + desc + nums + sound + other))
+        # Characters needed for expanded Chinese audio/video templates
+        audio_extra = list("纯弦波音调频率信号合成和弦效鸣响嗡嗡柔和刺耳沉静弱微快慢持续断脉冲滑载赫兹谐协单叠富丰几乎听喇叭奏节奏主双电子乐明亮体复合混复杂极果过程符轻警颤似基泛沙细随量")
+        video_extra = list("运沿穿过镜头片段呈匀速缓做物质机理解见报放播放数码矩周期性旁加内容列展示多央侧位底平移排度于分划均等组字")
+        return list(set(punct + colors + shapes + move + desc + nums + sound + other + grammar + extra + more + addn + audio_extra + video_extra))
 
     def _build_vocab(self):
         """Build a simple vocab from English + Chinese characters."""
@@ -84,6 +85,34 @@ class SimpleTokenizer:
         ]
 
         for ng in common_ngrams:
+            if ng not in self._vocab and len(self._vocab) < self.max_vocab:
+                self._vocab[ng] = len(self._vocab)
+
+        # Chinese ngrams for efficient encoding of synthetic captions
+        zh_ngrams = [
+            # Colors (2-3 char)
+            "红色", "绿色", "蓝色", "黄色", "紫色", "橙色",
+            "粉色", "白色", "黑色", "深蓝", "深灰", "深绿",
+            "深蓝色", "深绿色", "深灰色",
+            # Shapes (2-3 char)
+            "圆形", "正方形", "三角形", "星形", "心形", "菱形", "十字形",
+            # Directions (4 char)
+            "从左到右", "从右到左", "从上到下", "从下到上", "对角线",
+            # Image/video concepts
+            "背景上", "背景下", "背景中", "色背景",
+            "一个", "有一个", "移动", "画面", "方向",
+            "个图形", "图中", "图片",
+            # Audio concepts
+            "纯音", "高频", "低频", "正弦波", "白噪音", "噪音",
+            "柔和", "刺耳", "背景噪音",
+            "轻柔的", "低沉的", "一段", "声音", "信号",
+            "频率", "合成", "和弦", "音效", "音调",
+            # Common modifiers
+            "色的", "形的", "小的", "在黑色", "在深",
+            "在深蓝", "在深绿", "在深灰",
+        ]
+
+        for ng in zh_ngrams:
             if ng not in self._vocab and len(self._vocab) < self.max_vocab:
                 self._vocab[ng] = len(self._vocab)
 

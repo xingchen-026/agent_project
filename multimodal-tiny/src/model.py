@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 
 @dataclass
@@ -101,7 +100,8 @@ class RotaryEmbedding(nn.Module):
 def apply_rotary(x, cos, sin):
     T = x.shape[-2]
     half = x.shape[-1] // 2
-    cos, sin = cos[:T].reshape(1, 1, T, half), sin[:T].reshape(1, 1, T, half)
+    cos = cos[:T].reshape(1, 1, T, half).to(x.dtype)
+    sin = sin[:T].reshape(1, 1, T, half).to(x.dtype)
     x1, x2 = x[..., :half], x[..., half:]
     return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
 

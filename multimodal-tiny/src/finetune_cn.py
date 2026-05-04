@@ -13,18 +13,20 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from src.model import TinyMultimodal, ModelConfig
-from src.tokenizer import SimpleTokenizer
-from src.train import compute_text_loss, compute_mse_loss
+from model import TinyMultimodal, ModelConfig
+from tokenizer import SimpleTokenizer
+from utils import compute_text_loss, compute_mse_loss, make_collate, interleave_loaders, logger, DefaultConfig
 
 
 def get_args():
     parser = argparse.ArgumentParser(description="Phase 5 — Chinese Fine-tuning")
-    parser.add_argument("--resume", type=str, default="./checkpoints_phase4_5/best.pt",
-                        help="Phase 4.5 checkpoint to resume from")
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--resume", type=str, default="./checkpoints_phase5/best.pt",
+                        help="Checkpoint to resume from")
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--no_warmup", action="store_true",
+                        help="Skip warmup (use for continued fine-tuning)")
     parser.add_argument("--train_size", type=int, default=5000)
     parser.add_argument("--val_size", type=int, default=200)
     parser.add_argument("--aud_train_size", type=int, default=2000)
@@ -32,48 +34,9 @@ def get_args():
     parser.add_argument("--vid_train_size", type=int, default=2000)
     parser.add_argument("--vid_val_size", type=int, default=100)
     parser.add_argument("--max_text_len", type=int, default=48)
-    parser.add_argument("--output_dir", type=str, default="./checkpoints_phase5")
-    parser.add_argument("--log_dir", type=str, default="./logs_phase5")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_phase5_v2")
+    parser.add_argument("--log_dir", type=str, default="./logs_phase5_v2")
     return parser.parse_args()
-
-
-def resize_embeddings(model, old_vocab_size, new_vocab_size):
-    """
-    Resize model's embedding + lm_head to accommodate new vocab size.
-    Copies old weights for existing tokens, random init for new ones.
-    """
-    device = next(model.parameters()).device
-    dim = model.cfg.dim
-    
-    # Get old weights
-    old_embed_weight = model.text_embed.weight.data  # [old_vocab, dim]
-    old_lm_weight = model.lm_head.weight.data        # [old_vocab, dim]
-    
-    # Create new embedding
-    new_embed = torch.nn.Embedding(new_vocab_size, dim, device=device)
-    
-    # Copy old weights
-    new_embed.weight.data[:old_vocab_size] = old_embed_weight[:old_vocab_size]
-    
-    # Init new tokens with small random values (scaled to match existing)
-    std = old_embed_weight.std().item()
-    nn.init = torch.nn.init
-    nn.init.normal_(new_embed.weight.data[old_vocab_size:], mean=0.0, std=std * 0.3)
-    
-    # Replace model's embedding and lm_head
-    model.text_embed = new_embed
-    model.lm_head = torch.nn.Linear(dim, new_vocab_size, bias=False, device=device)
-    model.lm_head.weight.data[:old_vocab_size] = old_lm_weight[:old_vocab_size]
-    nn.init.normal_(model.lm_head.weight.data[old_vocab_size:], mean=0.0, std=std * 0.3)
-    
-    # Re-tie weights
-    model.text_embed.weight = model.lm_head.weight
-    
-    # Update config
-    model.cfg.vocab_size = new_vocab_size
-    
-    print(f"  Embedding resized: {old_vocab_size} → {new_vocab_size}")
-    return model
 
 
 def main():
@@ -83,16 +46,16 @@ def main():
     
     # ── Tokenizer (with Chinese) ──
     tokenizer = SimpleTokenizer(max_vocab=10000, add_chinese=True)
-    old_vocab_size = 1171  # Phase 4/4.5 vocab without Chinese
-    new_vocab_size = tokenizer.vocab_size  # ~1337
-    print(f"Tokenizer: {old_vocab_size} → {new_vocab_size} tokens")
+    new_vocab_size = tokenizer.vocab_size
+    # old_vocab_size will be read from checkpoint embedding shape
+    print(f"Tokenizer: new vocab = {new_vocab_size} (with Chinese ngrams)")
     
     # ── Model ──
     cfg = ModelConfig(
-        dim=384, n_layers=6,
-        image_size=224, patch_size=32,
+        dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
+        image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
         vocab_size=new_vocab_size,
-        img_generation=True, img_decoder_hidden=512,
+        img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
         use_audio=True, use_video=True,
     )
     model = TinyMultimodal(cfg).to(device)
@@ -102,18 +65,22 @@ def main():
         print(f"Loading checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
         state_dict = ckpt.get('model_state_dict', ckpt)
-        
-        # Load what we can (will fail on embedding/lm_head size mismatch)
+
+        # Read old vocab size from checkpoint embedding shape (not hardcoded)
+        old_vocab_size = state_dict['text_embed.weight'].shape[0]
+        print(f"  Checkpoint vocab: {old_vocab_size} → new: {new_vocab_size}")
+
         # Build a temp model with old vocab to load transformer weights
         temp_cfg = ModelConfig(
-            dim=384, n_layers=6, image_size=224, patch_size=32,
+            dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
+            image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
             vocab_size=old_vocab_size,
-            img_generation=True, img_decoder_hidden=512,
+            img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
             use_audio=True, use_video=True,
         )
-        from src.model import TinyMultimodal as TinyMultimodalOld
+        from model import TinyMultimodal as TinyMultimodalOld
         temp_model = TinyMultimodalOld(temp_cfg).to(device)
-        
+
         missing, unexpected = temp_model.load_state_dict(state_dict, strict=False)
         print(f"  Loaded from checkpoint: missing={len(missing)}, unexpected={len(unexpected)}")
         
@@ -142,10 +109,15 @@ def main():
         new_embed_data[:old_vocab_size] = old_embed[:old_vocab_size]
         new_lm_data[:old_vocab_size] = old_lm[:old_vocab_size]
         
-        # Init new Chinese tokens
-        std = old_embed.std().item()
-        torch.nn.init.normal_(new_embed_data[old_vocab_size:], mean=0.0, std=std * 0.3)
-        torch.nn.init.normal_(new_lm_data[old_vocab_size:], mean=0.0, std=std * 0.3)
+        # Init new Chinese tokens: mean of existing embeddings + small noise
+        # This anchors new tokens near the center of the trained embedding space
+        embed_mean = old_embed.mean(dim=0, keepdim=True)  # [1, dim]
+        embed_std = old_embed.std().item()
+        noise_std = embed_std * 0.1  # small perturbation
+        torch.nn.init.normal_(new_embed_data[old_vocab_size:], mean=0.0, std=noise_std)
+        new_embed_data[old_vocab_size:] += embed_mean
+        torch.nn.init.normal_(new_lm_data[old_vocab_size:], mean=0.0, std=noise_std)
+        new_lm_data[old_vocab_size:] += embed_mean
         
         # Re-tie
         model.text_embed.weight = model.lm_head.weight
@@ -161,32 +133,12 @@ def main():
     
     # ── Chinese Data ──
     print("Building Chinese data loaders...")
-    from src.cn_data import ZhImageDataset, ZhAudioDataset, ZhVideoDataset
+    from cn_data import ZhImageDataset, ZhAudioDataset, ZhVideoDataset
     
-    def img_collate(batch):
-        images, captions = zip(*batch)
-        images = torch.stack(images)
-        enc = tokenizer(list(captions), padding='max_length', truncation=True,
-                        max_length=args.max_text_len, return_tensors='pt')
-        return {'images': images, 'text_ids': enc['input_ids'],
-                'attn_mask': enc['attention_mask']}
-    
-    def aud_collate(batch):
-        mels, captions = zip(*batch)
-        mels = torch.stack(mels)
-        enc = tokenizer(list(captions), padding='max_length', truncation=True,
-                        max_length=args.max_text_len, return_tensors='pt')
-        return {'audios': mels, 'text_ids': enc['input_ids'],
-                'attn_mask': enc['attention_mask']}
-    
-    def vid_collate(batch):
-        videos, captions = zip(*batch)
-        videos = torch.stack(videos)
-        enc = tokenizer(list(captions), padding='max_length', truncation=True,
-                        max_length=args.max_text_len, return_tensors='pt')
-        return {'videos': videos, 'text_ids': enc['input_ids'],
-                'attn_mask': enc['attention_mask']}
-    
+    img_collate = make_collate(tokenizer, args.max_text_len, 'image')
+    aud_collate = make_collate(tokenizer, args.max_text_len, 'audio')
+    vid_collate = make_collate(tokenizer, args.max_text_len, 'video')
+
     train_ds_img = ZhImageDataset(num_samples=args.train_size)
     val_ds_img = ZhImageDataset(num_samples=args.val_size, seed=99)
     train_ds_aud = ZhAudioDataset(num_samples=args.aud_train_size)
@@ -214,43 +166,45 @@ def main():
         val_ds_vid, batch_size=args.batch_size,
         shuffle=False, collate_fn=vid_collate, num_workers=0)
     
-    # Interleave: img:aud:vid = 5:2:2 ratio
+    # Interleave: img:aud:vid round-robin
     loaders = [train_loader_img, train_loader_aud, train_loader_vid]
     labels = ['img', 'aud', 'vid']
-    
-    its = [iter(l) for l in loaders]
-    done = [False] * len(its)
-    train_loader = []
-    while not all(done):
-        for i, it in enumerate(its):
-            if not done[i]:
-                try:
-                    train_loader.append(next(it))
-                except StopIteration:
-                    done[i] = True
-    
-    val_its = [iter(val_loader_img), iter(val_loader_aud), iter(val_loader_vid)]
-    val_done = [False] * 3
-    val_loader = []
-    while not all(val_done):
-        for i, it in enumerate(val_its):
-            if not val_done[i]:
-                try:
-                    val_loader.append(next(it))
-                except StopIteration:
-                    val_done[i] = True
+    train_loader = interleave_loaders(*loaders)
+    val_loader = interleave_loaders(val_loader_img, val_loader_aud, val_loader_vid)
     
     sizes = [len(l) for l in loaders]
     print(f"  Train: {' + '.join(f'{s} {lbl}' for s, lbl in zip(sizes, labels))} "
           f"= {len(train_loader)} batches")
     
-    # ── Optimizer ──
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.05, betas=(0.9, 0.95))
+    # ── Optimizer (differential LR: faster for new embeddings, slower for transformer) ──
+    embed_params = []
+    body_params = []
+    decoder_params = []
+    for name, param in model.named_parameters():
+        if 'text_embed' in name or 'lm_head' in name:
+            embed_params.append(param)
+        elif 'decoder' in name or 'img_' in name or 'audio_' in name or 'video_' in name:
+            decoder_params.append(param)
+        else:
+            body_params.append(param)
+
+    param_groups = [
+        {'params': embed_params, 'lr': args.lr * 5.0},     # 5e-4 — fast adapt for new tokens
+        {'params': decoder_params, 'lr': args.lr * 2.0},   # 2e-4 — moderate
+        {'params': body_params, 'lr': args.lr},             # 1e-4 — slow for transformer body
+    ]
+    optimizer = AdamW(param_groups, weight_decay=0.05, betas=(0.9, 0.95))
+    print(f"  LR: embed={args.lr*5:.1e}, decoder={args.lr*2:.1e}, body={args.lr:.1e}")
     total_steps = len(train_loader) * args.epochs
-    warmup_steps = min(200, total_steps // 10)
-    warmup_sch = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
-    cosine_sch = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
-    scheduler = SequentialLR(optimizer, [warmup_sch, cosine_sch], milestones=[warmup_steps])
+    if args.no_warmup:
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
+        print(f"  LR schedule: CosineAnnealing (no warmup)")
+    else:
+        warmup_steps = min(200, total_steps // 10)
+        warmup_sch = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+        cosine_sch = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+        scheduler = SequentialLR(optimizer, [warmup_sch, cosine_sch], milestones=[warmup_steps])
+        print(f"  LR schedule: warmup={warmup_steps} + cosine")
     
     # ── Output ──
     output_dir = Path(args.output_dir)
@@ -276,57 +230,65 @@ def main():
     for epoch in range(args.epochs):
         model.train()
         epoch_losses = {}
+        train_counts = {'text': 0, 'img': 0, 'aud': 0, 'vid': 0}
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        
+
         for batch in pbar:
             text_ids = batch['text_ids'].to(device)
             attn_mask = batch['attn_mask'].to(device)
             images = batch.get('images', None)
             audios = batch.get('audios', None)
             videos = batch.get('videos', None)
-            
+
             if images is not None:
                 images = images.to(device)
             if audios is not None:
                 audios = audios.to(device)
             if videos is not None:
                 videos = videos.to(device)
-            
+
             return_img = images is not None
             return_audio = audios is not None
             return_video = videos is not None
-            
+
             out = model(text_ids, images=images, audios=audios, videos=videos,
                         return_img=return_img, return_audio=return_audio,
                         return_video=return_video)
-            
+
             text_logits = out if isinstance(out, torch.Tensor) else out['text_logits']
             loss = compute_text_loss(text_logits, text_ids, attn_mask)
-            
+            epoch_losses['text'] = epoch_losses.get('text', 0) + loss.item()
+            train_counts['text'] += 1
+
             # Reconstruction losses
             if return_img and 'img_recon' in out:
                 loss_img = compute_mse_loss(out['img_recon'], out['target_img'])
                 loss = loss + 0.5 * loss_img
                 epoch_losses['img'] = epoch_losses.get('img', 0) + loss_img.item()
-            
+                train_counts['img'] += 1
+
             if return_audio and 'aud_recon' in out:
                 loss_aud = compute_mse_loss(out['aud_recon'], out['target_aud'])
                 loss = loss + 0.5 * loss_aud
                 epoch_losses['aud'] = epoch_losses.get('aud', 0) + loss_aud.item()
-            
+                train_counts['aud'] += 1
+
             if return_video and 'vid_recon' in out:
                 loss_vid = compute_mse_loss(out['vid_recon'], out['target_vid'])
                 loss = loss + 0.5 * loss_vid
                 epoch_losses['vid'] = epoch_losses.get('vid', 0) + loss_vid.item()
-            
-            epoch_losses['text'] = epoch_losses.get('text', 0) + loss.item()
-            
+                train_counts['vid'] += 1
+
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                logger.warning(f"Gradient NaN/Inf (norm={grad_norm}), skipping step")
+                optimizer.zero_grad()
+                continue
             optimizer.step()
             scheduler.step()
-            
+
             pbar.set_postfix({'txt': f'{loss.item():.4f}'})
         
         # ── Validation ──
@@ -378,8 +340,9 @@ def main():
         # Log
         record = {'epoch': epoch + 1, 'lr': scheduler.get_last_lr()[0]}
         for key in ['text', 'img', 'aud', 'vid']:
-            if val_counts[key] > 0:
-                record[f'train_{key}_loss'] = epoch_losses.get(key, 0) / max(val_counts[key], 1)
+            if train_counts.get(key, 0) > 0:
+                record[f'train_{key}_loss'] = epoch_losses.get(key, 0) / train_counts[key]
+            if val_counts.get(key, 0) > 0:
                 record[f'val_{key}_loss'] = val_losses[key] / val_counts[key]
         
         combined_val = sum(record.get(f'val_{k}_loss', 0) for k in ['text', 'img', 'aud', 'vid'])

@@ -20,9 +20,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
 from model import TinyMultimodal, ModelConfig, patches_to_image, mel_patches_to_spectrogram
+from utils import compute_text_loss, compute_mse_loss, load_checkpoint_flexible, \
+    make_collate, interleave_loaders, logger
 from data import build_loaders
 from synthetic_data import SyntheticDataset
-from audio_synthetic import AudioDataset, get_audio_tokenizer_description
+from audio_synthetic import AudioDataset
 from video_synthetic import VideoDataset
 
 import warnings
@@ -72,44 +74,6 @@ def get_args():
     parser.add_argument("--log_dir", type=str, default="./logs")
     parser.add_argument("--resume", type=str, default=None)
     return parser.parse_args()
-
-
-def compute_text_loss(logits, text_ids, attn_mask):
-    shift_logits = logits[:, :-1].reshape(-1, logits.size(-1))
-    shift_labels = text_ids[:, 1:].reshape(-1)
-    shift_mask = attn_mask[:, 1:].reshape(-1)
-    loss = F.cross_entropy(shift_logits, shift_labels, reduction='none')
-    return (loss * shift_mask).sum() / shift_mask.sum()
-
-
-def compute_mse_loss(pred, target):
-    if pred is None or target is None:
-        return torch.tensor(0.0, device=pred.device if pred is not None else 'cpu')
-    return F.mse_loss(pred, target)
-
-
-def load_checkpoint_flexible(model, checkpoint_path, device='cpu'):
-    print(f"  Loading checkpoint: {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    state_dict = ckpt.get('model_state_dict', ckpt)
-
-    model_dict = model.state_dict()
-    loaded = 0
-    skipped = 0
-    for key in state_dict:
-        if key in model_dict and state_dict[key].shape == model_dict[key].shape:
-            model_dict[key] = state_dict[key]
-            loaded += 1
-        else:
-            skipped += 1
-
-    model.load_state_dict(model_dict, strict=False)
-    print(f"  ✓ Loaded {loaded}/{len(model_dict)} keys ({skipped} skipped - new layers)")
-
-    info = {}
-    if 'epoch' in ckpt:
-        info = {'epoch': ckpt['epoch'], 'best_loss': ckpt.get('best_loss', float('inf'))}
-    return info or {'best_loss': float('inf')}
 
 
 def train():
@@ -162,13 +126,7 @@ def train():
     print("Building data loaders...")
     use_img = args.img_gen or not args.use_audio
 
-    def image_collate(batch):
-        images, captions = zip(*batch)
-        images = torch.stack(images)
-        enc = tokenizer(list(captions), padding='max_length', truncation=True,
-                        max_length=args.max_text_len, return_tensors='pt')
-        return {'images': images, 'text_ids': enc['input_ids'],
-                'attn_mask': enc['attention_mask']}
+    img_collate = make_collate(tokenizer, args.max_text_len, 'image')
 
     if args.use_synthetic:
         print("  Using synthetic data (no download needed)")
@@ -179,10 +137,10 @@ def train():
 
         train_loader_img = torch.utils.data.DataLoader(
             train_ds_img, batch_size=args.batch_size,
-            shuffle=True, collate_fn=image_collate, num_workers=0)
+            shuffle=True, collate_fn=img_collate, num_workers=0)
         val_loader_img = torch.utils.data.DataLoader(
             val_ds_img, batch_size=args.batch_size,
-            shuffle=False, collate_fn=image_collate, num_workers=0)
+            shuffle=False, collate_fn=img_collate, num_workers=0)
 
         train_loader = train_loader_img
         val_loader = val_loader_img
@@ -194,41 +152,27 @@ def train():
 
     # ── Video data ──
     if args.use_video:
-        def video_collate(batch):
-            videos, captions = zip(*batch)
-            videos = torch.stack(videos)
-            enc = tokenizer(list(captions), padding='max_length', truncation=True,
-                            max_length=args.max_text_len, return_tensors='pt')
-            return {'videos': videos, 'text_ids': enc['input_ids'],
-                    'attn_mask': enc['attention_mask']}
-
+        vid_collate = make_collate(tokenizer, args.max_text_len, 'video')
         train_ds_vid = VideoDataset(num_samples=args.vid_train_size)
         val_ds_vid = VideoDataset(num_samples=args.vid_val_size, seed=99)
         train_loader_vid = torch.utils.data.DataLoader(
             train_ds_vid, batch_size=args.batch_size,
-            shuffle=True, collate_fn=video_collate, num_workers=0)
+            shuffle=True, collate_fn=vid_collate, num_workers=0)
         val_loader_vid = torch.utils.data.DataLoader(
             val_ds_vid, batch_size=args.batch_size,
-            shuffle=False, collate_fn=video_collate, num_workers=0)
+            shuffle=False, collate_fn=vid_collate, num_workers=0)
 
     # Audio data
     if args.use_audio:
-        def audio_collate(batch):
-            mels, captions = zip(*batch)
-            mels = torch.stack(mels)
-            enc = tokenizer(list(captions), padding='max_length', truncation=True,
-                            max_length=args.max_text_len, return_tensors='pt')
-            return {'audios': mels, 'text_ids': enc['input_ids'],
-                    'attn_mask': enc['attention_mask']}
-
+        aud_collate = make_collate(tokenizer, args.max_text_len, 'audio')
         train_ds_aud = AudioDataset(num_samples=args.aud_train_size)
         val_ds_aud = AudioDataset(num_samples=args.aud_val_size, seed=99)
         train_loader_aud = torch.utils.data.DataLoader(
             train_ds_aud, batch_size=args.batch_size,
-            shuffle=True, collate_fn=audio_collate, num_workers=0)
+            shuffle=True, collate_fn=aud_collate, num_workers=0)
         val_loader_aud = torch.utils.data.DataLoader(
             val_ds_aud, batch_size=args.batch_size,
-            shuffle=False, collate_fn=audio_collate, num_workers=0)
+            shuffle=False, collate_fn=aud_collate, num_workers=0)
 
     # ── Interleave loaders ──
     loaders_to_interleave = [train_loader_img, val_loader_img]
@@ -245,19 +189,8 @@ def train():
         loader_labels.append('vid')
 
     if len(loaders_to_interleave) > 1:
-        def interleave(*loaders):
-            """Alternate batches from multiple loaders (one from each round-robin)."""
-            its = [iter(l) for l in loaders]
-            done = [False] * len(its)
-            while not all(done):
-                for i, it in enumerate(its):
-                    if not done[i]:
-                        try:
-                            yield next(it)
-                        except StopIteration:
-                            done[i] = True
-        train_loader = list(interleave(*loaders_to_interleave))
-        val_loader = list(interleave(*loaders_val_to_interleave))
+        train_loader = interleave_loaders(*loaders_to_interleave)
+        val_loader = interleave_loaders(*loaders_val_to_interleave)
         sizes = [len(l) for l in loaders_to_interleave]
         print(f"  Combined: {len(train_loader)} train batches "
               f"({' + '.join(f'{s} {lbl}' for s, lbl in zip(sizes, loader_labels))})")
@@ -355,7 +288,11 @@ def train():
 
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                logger.warning(f"Gradient NaN/Inf (norm={grad_norm}), skipping step")
+                optimizer.zero_grad()
+                continue
             optimizer.step()
             scheduler.step()
 

@@ -10,7 +10,6 @@ import math
 import random
 import zipfile
 from pathlib import Path
-from io import BytesIO
 
 import torch
 from torch.utils.data import Dataset, DataLoader

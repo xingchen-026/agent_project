@@ -22,19 +22,17 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
 from src.model import TinyMultimodal, ModelConfig, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
 from src.tokenizer import SimpleTokenizer
 from src.synthetic_data import SyntheticDataset
 from src.audio_synthetic import AudioDataset
 from src.video_synthetic import VideoDataset
-from src.train import load_checkpoint_flexible
+from src.utils import load_checkpoint_flexible, DefaultConfig
 
 
 def get_args():
     parser = argparse.ArgumentParser(description="Evaluate Tiny Multimodal Model")
-    parser.add_argument("--checkpoint", type=str, default="./checkpoints_phase4/best.pt")
+    parser.add_argument("--checkpoint", type=str, default="./checkpoints_phase5_v2/best.pt")
     parser.add_argument("--output_dir", type=str, default="./eval_results")
     parser.add_argument("--num_samples", type=int, default=8)
     parser.add_argument("--img_train_size", type=int, default=500)
@@ -411,10 +409,10 @@ def main():
     
     # ── Model ──
     cfg = ModelConfig(
-        dim=384, n_layers=6,
-        image_size=224, patch_size=32,
+        dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
+        image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
         vocab_size=tokenizer.vocab_size,
-        img_generation=True, img_decoder_hidden=512,
+        img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
         use_audio=True, use_video=True,
     )
     model = TinyMultimodal(cfg).to(device)
@@ -434,10 +432,9 @@ def main():
     print("📈  TRAINING CURVES")
     print("="*60)
     metric_paths = {
-        'Phase1': './logs/metrics.json',
-        'Phase2': './logs_phase2/metrics.json',
-        'Phase3a': './logs_phase3a/metrics.json',
-        'Phase4': './logs_phase4/metrics.json',
+        'Phase4_5': './logs_phase4_5/metrics.json',
+        'Phase5': './logs_phase5/metrics.json',
+        'Phase5_v2': './logs_phase5_v2/metrics.json',
     }
     plot_training_curves(metric_paths, os.path.join(args.output_dir, 'training_curves.png'))
     

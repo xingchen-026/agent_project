@@ -192,9 +192,8 @@ def generate_audio_sample(seed=None):
 class AudioDataset(Dataset):
     """Synthetic audio dataset: (mel_spec, caption) pairs."""
 
-    def __init__(self, num_samples=5000, image_size=224, seed=None):
+    def __init__(self, num_samples=5000, seed=None):
         self.num_samples = num_samples
-        self.image_size = image_size
         self.seed = seed
 
     def __len__(self):

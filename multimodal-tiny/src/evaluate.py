@@ -17,6 +17,7 @@ import numpy as np
 
 from model import TinyMultimodal, ModelConfig, patches_to_image
 from tokenizer import SimpleTokenizer
+from utils import DefaultConfig
 from synthetic_data import generate_sample, SyntheticDataset
 
 
@@ -114,7 +115,8 @@ def main():
 
     # ── Config (must match training) ──
     cfg = ModelConfig(
-        dim=384, n_layers=6, image_size=224, patch_size=32,
+        dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
+        image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
         vocab_size=tokenizer.vocab_size, img_generation=True,
     )
 

@@ -17,18 +17,17 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from src.model import TinyMultimodal, ModelConfig, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
 from src.tokenizer import SimpleTokenizer
 from src.synthetic_data import SyntheticDataset
 from src.audio_synthetic import AudioDataset
 from src.video_synthetic import VideoDataset
-from src.train import load_checkpoint_flexible
+from src.utils import load_checkpoint_flexible, DefaultConfig
 
 
 def get_args():
     parser = argparse.ArgumentParser(description="TinyMultimodal Inference Demo")
-    parser.add_argument("--checkpoint", default="./checkpoints_phase4_5/best.pt",
+    parser.add_argument("--checkpoint", default="./checkpoints_phase5_v2/best.pt",
                         help="Model checkpoint")
     parser.add_argument("--output", default="./demo_output",
                         help="Output directory for figures")
@@ -45,9 +44,10 @@ def get_args():
 def load_model(checkpoint_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = SimpleTokenizer(max_vocab=10000)
-    cfg = ModelConfig(dim=384, n_layers=6, image_size=224, patch_size=32,
+    cfg = ModelConfig(dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
+                      image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
                       vocab_size=tokenizer.vocab_size,
-                      img_generation=True, img_decoder_hidden=512,
+                      img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
                       use_audio=True, use_video=True)
     model = TinyMultimodal(cfg).to(device)
     total = sum(p.numel() for p in model.parameters())
