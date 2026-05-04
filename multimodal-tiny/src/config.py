@@ -58,8 +58,12 @@ class ModelConfig:
     video_patch_size: int = 16
     video_patch_time: int = 2
 
+    # ── Memory Bank ──
+    use_memory_bank: bool = True
+    n_mem_tokens: int = 16
+
     # ── Version tracking ──
-    arch_version: str = "4.1"
+    arch_version: str = "5.0"
 
     # ── Computed fields (set in __post_init__, not serialized) ──
     head_dim: int = field(init=False, default=64)

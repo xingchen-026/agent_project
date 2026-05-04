@@ -133,6 +133,18 @@ def load_checkpoint_adaptive(model, checkpoint_path, device='cpu', verbose=True)
 
         model_dict['text_embed.weight'] = new_embed
 
+    # Backward compat: split old qkv weight into q_proj, k_proj, v_proj
+    for key in list(state_dict.keys()):
+        if '.attn.qkv.weight' in key:
+            old_weight = state_dict.pop(key)
+            d = old_weight.shape[0] // 3
+            prefix = key.replace('.attn.qkv.weight', '.attn')
+            state_dict[f'{prefix}.q_proj.weight'] = old_weight[:d]
+            state_dict[f'{prefix}.k_proj.weight'] = old_weight[d:2*d]
+            state_dict[f'{prefix}.v_proj.weight'] = old_weight[2*d:]
+            if verbose:
+                logger.info(f"  Split {key} -> q_proj, k_proj, v_proj")
+
     model.load_state_dict(model_dict, strict=False)
 
     if verbose:

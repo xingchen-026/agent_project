@@ -52,20 +52,46 @@ class SelfAttention(nn.Module):
         super().__init__()
         self.n_heads = cfg.n_heads
         self.head_dim = cfg.head_dim
-        self.qkv = nn.Linear(cfg.dim, 3 * cfg.dim, bias=False)
+        self.q_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
+        self.k_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
+        self.v_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
         self.proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x, cos, sin, mask=None):
+    def _proj_qkv(self, x):
         B, T, D = x.shape
-        qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.unbind(2)
-        q, k = self.q_norm(q).transpose(1, 2), self.k_norm(k).transpose(1, 2)
+        q = self.q_proj(x).reshape(B, T, self.n_heads, self.head_dim)
+        k = self.k_proj(x).reshape(B, T, self.n_heads, self.head_dim)
+        v = self.v_proj(x).reshape(B, T, self.n_heads, self.head_dim)
+        return q, k, v
+
+    def forward(self, x, cos, sin, mask=None, past_kv=None, use_cache=False):
+        B, T, D = x.shape
+        q, k, v = self._proj_qkv(x)
+
+        # QK norm + transpose
+        q = self.q_norm(q).transpose(1, 2)  # [B, n_heads, T, head_dim]
+        k = self.k_norm(k).transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # RoPE
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
-        out = F.scaled_dot_product_attention(q, k, v.transpose(1, 2),
-                                             attn_mask=mask, is_causal=(mask is None))
-        return self.proj(out.transpose(1, 2).reshape(B, T, D))
+
+        # KV Cache: concat with past
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        present_kv = (k, v) if use_cache else None
+
+        # With cache (q_len < k_len), must not use causal mask
+        attn_mask = mask
+        is_causal = (mask is None and past_kv is None)
+        out = F.scaled_dot_product_attention(q, k, v,
+                                             attn_mask=attn_mask, is_causal=is_causal)
+        return self.proj(out.transpose(1, 2).reshape(B, T, D)), present_kv
 
 
 class SwiGLU(nn.Module):
@@ -88,10 +114,44 @@ class TransformerBlock(nn.Module):
         self.mlp_norm = RMSNorm(cfg.dim)
         self.mlp = SwiGLU(cfg.dim, cfg.mlp_multiplier)
 
-    def forward(self, x, cos, sin):
-        x = x + self.attn(self.attn_norm(x), cos, sin)
+    def forward(self, x, cos, sin, mask=None, past_kv=None, use_cache=False):
+        attn_out, present_kv = self.attn(self.attn_norm(x), cos, sin,
+                                         mask=mask, past_kv=past_kv, use_cache=use_cache)
+        x = x + attn_out
         x = x + self.mlp(self.mlp_norm(x))
-        return x
+        return (x, present_kv) if use_cache else x
+
+
+# ── Memory Bank (Perceiver-style cross-modal compression) ────────────
+
+class MemoryBank(nn.Module):
+    """Compresses sensory patches into fixed-size memory tokens via cross-attention.
+
+    Input: sensory_patches [B, N_sensory, dim] (variable length)
+    Output: memory_tokens [B, n_mem, dim] (fixed size)
+    """
+    def __init__(self, dim, n_mem=16, n_heads=8, mlp_mult=4):
+        super().__init__()
+        self.n_mem = n_mem
+        self.memory = nn.Parameter(torch.empty(n_mem, dim))
+        torch.nn.init.normal_(self.memory, std=0.02)
+
+        self.cross_attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+        self.mlp = SwiGLU(dim, mlp_mult)
+
+    def forward(self, sensory):
+        B = sensory.shape[0]
+        mem = self.memory.unsqueeze(0).expand(B, -1, -1)
+
+        # Cross-attention: memory attends to sensory patches
+        attn_out, _ = self.cross_attn(mem, sensory, sensory)
+        mem = self.norm1(mem + attn_out)
+
+        # FFN
+        mem = self.norm2(mem + self.mlp(mem))
+        return mem
 
 
 # ── Decoder Heads ────────────────────────────────────────────────────
@@ -241,6 +301,13 @@ class TinyMultimodal(nn.Module):
                         5 if cfg.use_audio else 3))
             self.type_embed = nn.Embedding(n_types, cfg.dim)
 
+        # Memory Bank (compresses sensory patches → fixed-size memory tokens)
+        self.use_memory_bank = getattr(cfg, 'use_memory_bank', False)
+        if self.use_memory_bank:
+            n_mem = getattr(cfg, 'n_mem_tokens', 16)
+            self.memory_bank = MemoryBank(cfg.dim, n_mem=n_mem, n_heads=cfg.n_heads,
+                                          mlp_mult=cfg.mlp_multiplier)
+
         # Transformer
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.dim)
@@ -330,16 +397,8 @@ class TinyMultimodal(nn.Module):
 
     def forward(self, text_ids, images=None, audios=None, videos=None,
                 return_img=False, return_audio=False, return_video=False,
-                img_gen_mode=False, audio_gen_mode=False):
-        """
-        Args:
-            text_ids: [B, T]
-            images: [B, 3, H, W] or None
-            audios: [B, 1, n_mels, T] or None
-            videos: [B, 3, T, H, W] or None
-        Returns:
-            text_logits or (text_logits, recon_dict)
-        """
+                img_gen_mode=False, audio_gen_mode=False,
+                past_key_values=None, use_cache=False):
         B = text_ids.shape[0]
         device = text_ids.device
         n_img = self.get_num_image_tokens()
@@ -347,96 +406,149 @@ class TinyMultimodal(nn.Module):
         tokens_list = []
         type_ids_list = []
 
-        # ── Video tokens (first in sequence) ──
-        n_vid = 0
-        if self.cfg.use_video:
-            if videos is not None:
-                n_vid = self.get_num_video_tokens(videos)
-                vid_patches = self._video_to_patches(videos)
-                target_patches['video'] = vid_patches.detach()
-                vid_tokens = self.video_norm(self.video_proj(vid_patches))
-                vtype = torch.full((B, n_vid), 5, device=device, dtype=torch.long)
-            else:
-                n_vid = self.get_num_video_tokens()
-                vid_tokens = self.video_placeholder.expand(B, n_vid, -1)
-                vtype = torch.full((B, n_vid), 6, device=device, dtype=torch.long)
-                target_patches['video'] = None
-            tokens_list.append(vid_tokens)
-            type_ids_list.append(vtype)
-
-        # ── Image tokens ──
-        if img_gen_mode or images is None:
-            img_tokens = self.img_placeholder.expand(B, n_img, -1)
-            ttype = torch.full((B, n_img), 3, device=device, dtype=torch.long)
-            target_patches['image'] = None
+        # ── Sensory encoding (skipped when using KV cache) ──
+        if past_key_values is not None:
+            # Incremental step: only embed new text token
+            n_vid = 0 if not self.cfg.use_video else self.get_num_video_tokens()
+            n_aud = 0 if not self.cfg.use_audio else self.get_num_audio_tokens()
+            text_tokens = self.text_embed(text_ids)
+            ttype = torch.zeros(B, text_ids.shape[1], device=device, dtype=torch.long)
+            tokens_list.append(text_tokens)
+            type_ids_list.append(ttype)
+            x = torch.cat(tokens_list, dim=1)
+            if self.cfg.use_type_embed:
+                type_ids = torch.cat(type_ids_list, dim=1)
+                x = x + self.type_embed(type_ids)
+            total_len = x.shape[1]
+            cache_len = past_key_values[0][0].shape[2] if past_key_values[0] else 0
+            cos, sin = self.rope(cache_len + total_len, device)
+            cos, sin = cos[cache_len:], sin[cache_len:]
+            mask = None  # incremental: no mask needed (q_len=1, sees all cached)
         else:
-            patches = self._image_to_patches(images)
-            target_patches['image'] = patches.detach()
-            img_tokens = self.img_norm(self.img_proj(patches))
-            ttype = torch.full((B, n_img), 1, device=device, dtype=torch.long)
-        tokens_list.append(img_tokens)
-        type_ids_list.append(ttype)
+            # ── Video tokens ──
+            n_vid = 0
+            if self.cfg.use_video:
+                if videos is not None:
+                    n_vid = self.get_num_video_tokens(videos)
+                    vid_patches = self._video_to_patches(videos)
+                    target_patches['video'] = vid_patches.detach()
+                    vid_tokens = self.video_norm(self.video_proj(vid_patches))
+                    vtype = torch.full((B, n_vid), 5, device=device, dtype=torch.long)
+                else:
+                    n_vid = self.get_num_video_tokens()
+                    vid_tokens = self.video_placeholder.expand(B, n_vid, -1)
+                    vtype = torch.full((B, n_vid), 6, device=device, dtype=torch.long)
+                    target_patches['video'] = None
+                tokens_list.append(vid_tokens)
+                type_ids_list.append(vtype)
 
-        # ── Audio tokens ──
-        n_aud = 0
-        if self.cfg.use_audio:
-            if audio_gen_mode or audios is None:
-                n_aud = self.get_num_audio_tokens()  # from config
-                aud_tokens = self.audio_placeholder.expand(B, n_aud, -1)
-                atype = torch.full((B, n_aud), 4, device=device, dtype=torch.long)
-                target_patches['audio'] = None
+            # ── Image tokens ──
+            if img_gen_mode or images is None:
+                img_tokens = self.img_placeholder.expand(B, n_img, -1)
+                ttype = torch.full((B, n_img), 3, device=device, dtype=torch.long)
+                target_patches['image'] = None
             else:
-                n_aud = self.get_num_audio_tokens(audios)
-                aud_patches = self._spectrogram_to_patches(audios)
-                target_patches['audio'] = aud_patches.detach()
-                aud_tokens = self.audio_norm(self.audio_proj(aud_patches))
-                atype = torch.full((B, n_aud), 2, device=device, dtype=torch.long)
-            tokens_list.append(aud_tokens)
-            type_ids_list.append(atype)
+                patches = self._image_to_patches(images)
+                target_patches['image'] = patches.detach()
+                img_tokens = self.img_norm(self.img_proj(patches))
+                ttype = torch.full((B, n_img), 1, device=device, dtype=torch.long)
+            tokens_list.append(img_tokens)
+            type_ids_list.append(ttype)
 
-        # ── Text tokens ──
-        text_tokens = self.text_embed(text_ids)
-        ttype = torch.zeros(B, text_ids.shape[1], device=device, dtype=torch.long)
-        tokens_list.append(text_tokens)
-        type_ids_list.append(ttype)
+            # ── Audio tokens ──
+            n_aud = 0
+            if self.cfg.use_audio:
+                if audio_gen_mode or audios is None:
+                    n_aud = self.get_num_audio_tokens()
+                    aud_tokens = self.audio_placeholder.expand(B, n_aud, -1)
+                    atype = torch.full((B, n_aud), 4, device=device, dtype=torch.long)
+                    target_patches['audio'] = None
+                else:
+                    n_aud = self.get_num_audio_tokens(audios)
+                    aud_patches = self._spectrogram_to_patches(audios)
+                    target_patches['audio'] = aud_patches.detach()
+                    aud_tokens = self.audio_norm(self.audio_proj(aud_patches))
+                    atype = torch.full((B, n_aud), 2, device=device, dtype=torch.long)
+                tokens_list.append(aud_tokens)
+                type_ids_list.append(atype)
 
-        # ── Combine ──
-        x = torch.cat(tokens_list, dim=1)
-        if self.cfg.use_type_embed:
-            type_ids = torch.cat(type_ids_list, dim=1)
-            x = x + self.type_embed(type_ids)
+            # ── Text tokens ──
+            text_tokens = self.text_embed(text_ids)
+            ttype = torch.zeros(B, text_ids.shape[1], device=device, dtype=torch.long)
+            tokens_list.append(text_tokens)
+            type_ids_list.append(ttype)
 
-        total_len = x.shape[1]
-        cos, sin = self.rope(total_len, device)
-        mask = self._make_attention_mask(n_vid, n_img, n_aud, total_len, device)
+            # ── Memory Bank: compress sensory → fixed-size memory tokens ──
+            if self.use_memory_bank and tokens_list[:-1]:  # skip text
+                # Concatenate all sensory patches
+                sensory = torch.cat(tokens_list[:-1], dim=1)  # [video | image | audio]
+                mem_tokens = self.memory_bank(sensory)  # [B, n_mem, dim]
+                # Replace sensory tokens with compressed memory tokens
+                # New sequence: [memory | text]
+                x = torch.cat([mem_tokens, tokens_list[-1]], dim=1)
+                n_sensory_for_mask = self.memory_bank.n_mem
+                n_vid_mem, n_img_mem, n_aud_mem = n_sensory_for_mask, 0, 0
+                # Type embed: mem=1 (image type), text=0
+                if self.cfg.use_type_embed:
+                    mem_type = torch.full((B, n_sensory_for_mask), 1, device=device, dtype=torch.long)
+                    txt_type = torch.zeros(B, tokens_list[-1].shape[1], device=device, dtype=torch.long)
+                    type_ids = torch.cat([mem_type, txt_type], dim=1)
+                    x = x + self.type_embed(type_ids)
+            else:
+                x = torch.cat(tokens_list, dim=1)
+                if self.cfg.use_type_embed:
+                    type_ids = torch.cat(type_ids_list, dim=1)
+                    x = x + self.type_embed(type_ids)
+                n_vid_mem, n_img_mem, n_aud_mem = n_vid, n_img, n_aud
+                n_sensory_for_mask = n_vid + n_img + n_aud
 
-        for block in self.blocks:
-            x = block(x, cos, sin)
+            total_len = x.shape[1]
+            cos, sin = self.rope(total_len, device)
+            mask = self._make_attention_mask(n_vid_mem, n_img_mem, n_aud_mem, total_len, device)
+
+        # ── Transformer (with mask + KV cache) ──
+        new_kvs = [] if use_cache else None
+        for i, block in enumerate(self.blocks):
+            pkv = past_key_values[i] if past_key_values else None
+            out = block(x, cos, sin, mask=mask, past_kv=pkv, use_cache=use_cache)
+            if use_cache:
+                x, present_kv = out
+                new_kvs.append(present_kv)
+            else:
+                x = out
         x = self.final_norm(x)
 
         # ── Text output ──
-        n_sensory = n_vid + n_img + n_aud
-        text_logits = self.lm_head(x[:, n_sensory:])
+        if past_key_values is not None:
+            text_logits = self.lm_head(x)  # only text tokens present
+        elif self.use_memory_bank:
+            n_sensory = self.memory_bank.n_mem
+            text_logits = self.lm_head(x[:, n_sensory:])
+        else:
+            n_sensory = n_vid + n_img + n_aud
+            text_logits = self.lm_head(x[:, n_sensory:])
 
         # ── Reconstruction outputs ──
         results = {'text_logits': text_logits}
+        if use_cache:
+            results['past_key_values'] = new_kvs
 
-        if return_img and self.cfg.img_generation:
+        if return_img and self.cfg.img_generation and past_key_values is None:
             img_hidden = x[:, n_vid:n_vid + n_img]
             results['img_recon'] = self.img_decoder(img_hidden)
             results['target_img'] = target_patches.get('image')
 
-        if return_audio and self.cfg.use_audio and n_aud > 0 and audios is not None:
+        if return_audio and self.cfg.use_audio and n_aud > 0 and audios is not None and past_key_values is None:
             aud_hidden = x[:, n_vid + n_img:n_vid + n_img + n_aud]
             results['aud_recon'] = self.audio_decoder(aud_hidden)
             results['target_aud'] = target_patches.get('audio')
 
-        if return_video and self.cfg.use_video and n_vid > 0 and videos is not None:
+        if return_video and self.cfg.use_video and n_vid > 0 and videos is not None and past_key_values is None:
             vid_hidden = x[:, :n_vid]
             results['vid_recon'] = self.video_decoder(vid_hidden)
             results['target_vid'] = target_patches.get('video')
 
-        if return_img or return_audio or return_video:
+        if return_img or return_audio or return_video or use_cache:
             return results
         return text_logits
 
@@ -445,7 +557,7 @@ class TinyMultimodal(nn.Module):
     @torch.no_grad()
     def generate_text(self, image, tokenizer, audio=None, video=None, max_len=50,
                       temperature=0.8, top_k=50):
-        """Generate text description from image (optionally + audio/video)."""
+        """Generate text from image (+ optional audio/video) using KV cache."""
         self.eval()
         device = next(self.parameters()).device
         if image is not None and image.dim() == 3:
@@ -456,27 +568,42 @@ class TinyMultimodal(nn.Module):
             video = video.unsqueeze(0)
 
         bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
+
+        # Step 1: Prefill — encode sensory + BOS token, cache all K/V
         text_ids = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
-        generated = []
+        out = self(text_ids, images=image, audios=audio, videos=video, use_cache=True)
+        past_key_values = out['past_key_values']
+        logits = out['text_logits']
 
-        for _ in range(max_len):
-            out = self(text_ids, images=image, audios=audio, videos=video)
-            logits = out if isinstance(out, torch.Tensor) else out['text_logits']
+        # Sample first token
+        next_logits = logits[0, -1] / temperature
+        if top_k > 0:
+            vals, _ = next_logits.topk(min(top_k, len(next_logits)))
+            next_logits[next_logits < vals[-1]] = float('-inf')
+        probs = F.softmax(next_logits, dim=-1)
+        next_id = torch.multinomial(probs, 1).item()
+
+        if next_id == tokenizer.eos_token_id:
+            return ""
+        generated = [next_id]
+
+        # Step 2: Incremental decoding with KV cache
+        for _ in range(max_len - 1):
+            text_ids = torch.tensor([[next_id]], dtype=torch.long, device=device)
+            out = self(text_ids, use_cache=True, past_key_values=past_key_values)
+            past_key_values = out['past_key_values']
+            logits = out['text_logits']
+
             next_logits = logits[0, -1] / temperature
-
             if top_k > 0:
                 vals, _ = next_logits.topk(min(top_k, len(next_logits)))
                 next_logits[next_logits < vals[-1]] = float('-inf')
-
             probs = F.softmax(next_logits, dim=-1)
             next_id = torch.multinomial(probs, 1).item()
 
             if next_id == tokenizer.eos_token_id:
                 break
             generated.append(next_id)
-            text_ids = torch.cat([text_ids, torch.tensor([[next_id]], device=device)], dim=1)
-            if text_ids.shape[1] > 100:
-                break
 
         return tokenizer.decode(generated)
 
