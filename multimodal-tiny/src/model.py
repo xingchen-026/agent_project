@@ -554,6 +554,77 @@ class TinyMultimodal(nn.Module):
 
     # ── Inference ──
 
+    def start_conversation(self, image, audio=None, video=None):
+        """Initialize multi-turn conversation with sensory input.
+        Returns a 'context' dict with cached memory + KV cache for subsequent chat() calls.
+        """
+        device = next(self.parameters()).device
+        if image is not None and image.dim() == 3:
+            image = image.unsqueeze(0)
+        if audio is not None and audio.dim() == 3:
+            audio = audio.unsqueeze(0)
+        if video is not None and video.dim() == 4:
+            video = video.unsqueeze(0)
+
+        bos_id = 2  # <bos>
+        text_ids = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
+        out = self(text_ids, images=image, audios=audio, videos=video, use_cache=True)
+        return {'past_key_values': out['past_key_values'],
+                'context_text': ''}
+
+    @torch.no_grad()
+    def chat(self, context, prompt_text, tokenizer, max_len=50, temperature=0.8, top_k=50):
+        """Generate response in a multi-turn conversation.
+        Uses cached memory + KV from start_conversation().
+        Returns (response_text, updated_context).
+        """
+        self.eval()
+        device = next(self.parameters()).device
+        past_key_values = context['past_key_values']
+
+        # Encode the prompt text as continuation
+        full_text = context.get('context_text', '') + prompt_text
+        prompt_ids = torch.tensor([[2] + tokenizer.encode(prompt_text)],
+                                  dtype=torch.long, device=device)[:, :64]
+        out = self(prompt_ids, use_cache=True, past_key_values=past_key_values)
+        past_key_values = out['past_key_values']
+        logits = out['text_logits']
+
+        # Sample first response token
+        next_logits = logits[0, -1] / temperature
+        if top_k > 0:
+            vals, _ = next_logits.topk(min(top_k, len(next_logits)))
+            next_logits[next_logits < vals[-1]] = float('-inf')
+        probs = F.softmax(next_logits, dim=-1)
+        next_id = torch.multinomial(probs, 1).item()
+
+        if next_id == tokenizer.eos_token_id:
+            return '', context
+        generated = [next_id]
+
+        # Decode
+        for _ in range(max_len - 1):
+            text_ids = torch.tensor([[next_id]], dtype=torch.long, device=device)
+            out = self(text_ids, use_cache=True, past_key_values=past_key_values)
+            past_key_values = out['past_key_values']
+            logits = out['text_logits']
+            next_logits = logits[0, -1] / temperature
+            if top_k > 0:
+                vals, _ = next_logits.topk(min(top_k, len(next_logits)))
+                next_logits[next_logits < vals[-1]] = float('-inf')
+            probs = F.softmax(next_logits, dim=-1)
+            next_id = torch.multinomial(probs, 1).item()
+            if next_id == tokenizer.eos_token_id:
+                break
+            generated.append(next_id)
+
+        response = tokenizer.decode(generated)
+        new_context = {
+            'past_key_values': past_key_values,
+            'context_text': context.get('context_text', '') + prompt_text + response,
+        }
+        return response, new_context
+
     @torch.no_grad()
     def generate_text(self, image, tokenizer, audio=None, video=None, max_len=50,
                       temperature=0.8, top_k=50):
