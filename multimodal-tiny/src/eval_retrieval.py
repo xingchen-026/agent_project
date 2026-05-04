@@ -18,10 +18,11 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import TinyMultimodal, ModelConfig
+from model import TinyMultimodal
 from tokenizer import SimpleTokenizer
 from cn_data import ZhImageDataset
-from utils import load_checkpoint_flexible, DefaultConfig
+from config import resolve_config
+from utils import load_checkpoint_adaptive
 
 
 # ── Embedding extraction ──────────────────────────────────────────
@@ -242,18 +243,13 @@ def main():
     tokenizer = SimpleTokenizer(max_vocab=10000)
     print(f"Tokenizer: {tokenizer.vocab_size} tokens")
 
-    cfg = ModelConfig(
-        dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
-        image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
-        vocab_size=tokenizer.vocab_size,
-        img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
-        use_audio=True, use_video=True,
-    )
+    cfg = resolve_config(args.checkpoint, tokenizer,
+        defaults={'img_generation': True, 'use_audio': True, 'use_video': True})
     model = TinyMultimodal(cfg).to(device)
-    print(f"Model: {sum(p.numel() for p in model.parameters())/1e6:.2f}M params")
+    print(f"Model: {sum(p.numel() for p in model.parameters())/1e6:.2f}M params ({cfg.describe()})")
 
     if os.path.exists(args.checkpoint):
-        load_checkpoint_flexible(model, args.checkpoint, device)
+        load_checkpoint_adaptive(model, args.checkpoint, device)
         print(f"Loaded: {args.checkpoint}")
     else:
         print(f"ERROR: checkpoint not found: {args.checkpoint}")

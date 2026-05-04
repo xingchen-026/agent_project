@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tiny Multimodal Transformer — validating sub-30M parameter native multimodal (text+image+audio+video+Chinese) models. Built with PyTorch 2.11+cu128, Python 3.12. Currently 18.88M params.
+Tiny Multimodal Transformer — validating sub-31M parameter native multimodal (text+image+audio+video+Chinese) models. Built with PyTorch 2.11+cu128, Python 3.12. Currently 30.97M params.
 
 ## Commands (Windows PowerShell)
 
@@ -20,9 +20,9 @@ export PYTHONIOENCODING=utf-8
 # ── Training ──
 cd multimodal-tiny
 .\run.ps1 phase4                        # Phase 4 (all modalities from scratch)
+.\run.ps1 phase6                        # Phase 6 (448d-8L-7h, 30.97M)
 .\run.ps1 phase5_v2                     # Phase 5 v2 (Chinese continued FT)
-.\run.ps1 phase5_v3                     # Phase 5 v3 (COCO-CN real Chinese FT)
-# Or with Git Bash: ./run.sh phase5_v2
+# Or with Git Bash: ./run.sh phase6
 
 cd src
 # COCO-CN real Chinese fine-tuning
@@ -75,6 +75,7 @@ python inference_demo.py --checkpoint ..\checkpoints_phase5_v2\best.pt --test-al
 | 5 | +Chinese | text=0.079, img=0.015, aud=0.0002, vid=0.036 | `checkpoints_phase5/` |
 | 5 v2 | native CN templates, +132 tokens, 20ep | text=0.048, img=0.015, aud=0.0003, vid=0.029 | `checkpoints_phase5_v2/` |
 | 5 v3 | COCO-CN real Chinese images, 10ep | val_loss=2.03 (COCO-CN) | `checkpoints_phase5_v3/` |
+| 6 | scaled-up 448d-8L-7h, 30.97M, 15ep | text=0.012, img=0.013, aud=0.0001, vid=0.023 | `checkpoints_phase6/` |
 
 ## Evaluation results (Phase 5 v2)
 

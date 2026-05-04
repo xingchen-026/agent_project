@@ -45,6 +45,10 @@ def get_args():
     # Model
     parser.add_argument("--dim", type=int, default=384)
     parser.add_argument("--layers", type=int, default=6)
+    parser.add_argument("--n_heads", type=int, default=None,
+                        help="Number of attention heads (default: dim//64)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to model_config.json (overrides individual args)")
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--patch_size", type=int, default=32)
 
@@ -92,26 +96,33 @@ def train():
     tokenizer = SimpleTokenizer(max_vocab=10000)
 
     # ── Config ──
-    cfg = ModelConfig(
-        dim=args.dim,
-        n_layers=args.layers,
-        image_size=args.image_size,
-        patch_size=args.patch_size,
-        vocab_size=tokenizer.vocab_size,
-        img_generation=args.img_gen,
-        img_decoder_hidden=args.img_decoder_hidden,
-        use_audio=args.use_audio,
-        use_video=args.use_video,
-    )
+    if args.config:
+        from config import ModelConfig as MC
+        cfg = MC.from_json(args.config)
+        print(f"Loaded config from {args.config}: {cfg.describe()}")
+    else:
+        n_heads = args.n_heads if args.n_heads else args.dim // 64
+        cfg = ModelConfig(
+            dim=args.dim,
+            n_layers=args.layers,
+            n_heads=n_heads,
+            image_size=args.image_size,
+            patch_size=args.patch_size,
+            vocab_size=tokenizer.vocab_size,
+            img_generation=args.img_gen,
+            img_decoder_hidden=args.img_decoder_hidden,
+            use_audio=args.use_audio,
+            use_video=args.use_video,
+        )
 
     # ── Model ──
-    print(f"Building TinyMultimodal v3.0: {cfg.n_layers} layers, {cfg.dim} dim")
+    print(f"Building TinyMultimodal: {cfg.describe()}")
     model = TinyMultimodal(cfg).to(device)
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Parameters: {total/1e6:.2f}M (trainable: {trainable/1e6:.2f}M)")
     if total > 30_000_000:
-        print(f"  ⚠️  Over 30M budget!")
+        print(f"  Over 30M budget — adjust dim/layers")
 
     # ── Resume ──
     start_epoch = 0
@@ -377,7 +388,9 @@ def train():
             ckpt_path = output_dir / f"epoch_{epoch+1}.pt"
             save_dict = {'epoch': epoch, 'model_state_dict': model.state_dict(),
                          'optimizer_state_dict': optimizer.state_dict(),
-                         'best_loss': best_loss, 'phase': 3 if args.use_audio else 2}
+                         'best_loss': best_loss, 'phase': 3 if args.use_audio else 2,
+                         'model_config': cfg.to_dict(),
+                         'arch_version': cfg.arch_version}
             for k in ['text', 'img', 'aud', 'vid']:
                 if k in val_losses:
                     save_dict[f'val_{k}_loss'] = val_losses[k]
@@ -387,8 +400,11 @@ def train():
 
             if is_best:
                 best_path = output_dir / "best.pt"
-                torch.save(model.state_dict(), best_path)
-                print(f"  \u2713 New best (combined: {combined:.4f})")
+                torch.save({'model_state_dict': model.state_dict(),
+                            'model_config': cfg.to_dict(),
+                            'arch_version': cfg.arch_version,
+                            'epoch': epoch, 'best_loss': best_loss}, best_path)
+                print(f"  [OK] New best (combined: {combined:.4f})")
 
         # ── Log ──
         log_entry = {'epoch': epoch + 1, 'lr': scheduler.get_last_lr()[0]}

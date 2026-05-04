@@ -15,9 +15,10 @@ import torch.nn.functional as F
 from PIL import Image as PILImage
 import numpy as np
 
-from model import TinyMultimodal, ModelConfig, patches_to_image
+from model import TinyMultimodal, patches_to_image
 from tokenizer import SimpleTokenizer
-from utils import DefaultConfig
+from config import resolve_config
+from utils import load_checkpoint_adaptive
 from synthetic_data import generate_sample, SyntheticDataset
 
 
@@ -113,23 +114,14 @@ def main():
     # ── Tokenizer ──
     tokenizer = SimpleTokenizer(max_vocab=10000)
 
-    # ── Config (must match training) ──
-    cfg = ModelConfig(
-        dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
-        image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
-        vocab_size=tokenizer.vocab_size, img_generation=True,
-    )
-
-    # ── Model ──
+    # ── Config (auto-detected from checkpoint) ──
+    cfg = resolve_config(args.checkpoint, tokenizer,
+        defaults={'img_generation': True, 'use_audio': False, 'use_video': False})
     model = TinyMultimodal(cfg).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    if 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'], strict=False)
-    else:
-        model.load_state_dict(ckpt, strict=False)
+    load_checkpoint_adaptive(model, args.checkpoint, device)
     model.eval()
     params = sum(p.numel() for p in model.parameters())
-    print(f"Model: {cfg.n_layers}L/{cfg.dim}d ({params/1e6:.2f}M)")
+    print(f"Model: {cfg.describe()} ({params/1e6:.2f}M)")
 
     # ── Run tests ──
     if args.test in ("all", "text_gen"):

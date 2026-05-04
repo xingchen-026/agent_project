@@ -17,12 +17,13 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
-from src.model import TinyMultimodal, ModelConfig, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
+from src.model import TinyMultimodal, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
 from src.tokenizer import SimpleTokenizer
 from src.synthetic_data import SyntheticDataset
 from src.audio_synthetic import AudioDataset
 from src.video_synthetic import VideoDataset
-from src.utils import load_checkpoint_flexible, DefaultConfig
+from src.config import resolve_config
+from src.utils import load_checkpoint_adaptive
 
 
 def get_args():
@@ -44,17 +45,14 @@ def get_args():
 def load_model(checkpoint_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = SimpleTokenizer(max_vocab=10000)
-    cfg = ModelConfig(dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
-                      image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
-                      vocab_size=tokenizer.vocab_size,
-                      img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
-                      use_audio=True, use_video=True)
+    cfg = resolve_config(checkpoint_path, tokenizer,
+        defaults={'img_generation': True, 'use_audio': True, 'use_video': True})
     model = TinyMultimodal(cfg).to(device)
     total = sum(p.numel() for p in model.parameters())
     info = {}
     if os.path.exists(checkpoint_path):
-        info = load_checkpoint_flexible(model, checkpoint_path, device)
-    print(f"Model: {total/1e6:.2f}M parameters ({'CUDA' if torch.cuda.is_available() else 'CPU'})")
+        info = load_checkpoint_adaptive(model, checkpoint_path, device)
+    print(f"Model: {total/1e6:.2f}M parameters ({cfg.describe()}, {'CUDA' if torch.cuda.is_available() else 'CPU'})")
     return model, tokenizer, device
 
 

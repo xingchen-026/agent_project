@@ -22,9 +22,10 @@ from tqdm import tqdm
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import TinyMultimodal, ModelConfig
+from model import TinyMultimodal
 from tokenizer import SimpleTokenizer
-from utils import compute_text_loss, DefaultConfig, logger
+from config import resolve_config
+from utils import compute_text_loss, logger, load_checkpoint_adaptive
 
 
 # ── COCO-CN Dataset ───────────────────────────────────────────────
@@ -122,51 +123,15 @@ def main():
     print(f"Tokenizer: {new_vocab_size} tokens")
 
     # Model
-    cfg = ModelConfig(
-        dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
-        image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
-        vocab_size=new_vocab_size,
-        img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
-        use_audio=True, use_video=True,
-    )
+    # Model
+    cfg = resolve_config(args.resume, tokenizer,
+        defaults={'img_generation': True, 'use_audio': True, 'use_video': True})
     model = TinyMultimodal(cfg).to(device)
 
-    # Load checkpoint
+    # Load checkpoint (handles vocab/dim/layer changes automatically)
     if os.path.exists(args.resume):
-        ckpt = torch.load(args.resume, map_location=device)
-        state_dict = ckpt.get('model_state_dict', ckpt)
-        old_vocab_size = state_dict['text_embed.weight'].shape[0]
-        print(f"  Checkpoint vocab: {old_vocab_size} -> new: {new_vocab_size}")
-
-        temp_cfg = ModelConfig(
-            dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
-            image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
-            vocab_size=old_vocab_size,
-            img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
-            use_audio=True, use_video=True,
-        )
-        temp_model = TinyMultimodal(temp_cfg).to(device)
-        temp_model.load_state_dict(state_dict, strict=False)
-
-        model_dict = model.state_dict()
-        for key, val in temp_model.state_dict().items():
-            if key in model_dict and val.shape == model_dict[key].shape:
-                model_dict[key] = val
-        model.load_state_dict(model_dict, strict=False)
-
-        # Resize embeddings
-        old_embed = temp_model.text_embed.weight.data
-        new_embed = model.text_embed.weight.data
-        new_embed[:old_vocab_size] = old_embed[:old_vocab_size]
-        embed_mean = old_embed.mean(dim=0, keepdim=True)
-        embed_std = old_embed.std().item()
-        torch.nn.init.normal_(new_embed[old_vocab_size:], mean=0.0, std=embed_std * 0.1)
-        new_embed[old_vocab_size:] += embed_mean
-        model.lm_head.weight.data[:old_vocab_size] = temp_model.lm_head.weight.data[:old_vocab_size]
-        model.lm_head.weight.data[old_vocab_size:] = new_embed[old_vocab_size:]
-        model.text_embed.weight = model.lm_head.weight
-        del temp_model
-        print(f"  Checkpoint loaded, embeddings resized")
+        print(f"Loading checkpoint: {args.resume}")
+        load_checkpoint_adaptive(model, args.resume, device)
     else:
         print(f"  WARNING: checkpoint not found: {args.resume}")
 

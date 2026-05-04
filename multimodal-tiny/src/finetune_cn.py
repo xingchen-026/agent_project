@@ -13,9 +13,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import TinyMultimodal, ModelConfig
+from model import TinyMultimodal
 from tokenizer import SimpleTokenizer
-from utils import compute_text_loss, compute_mse_loss, make_collate, interleave_loaders, logger, DefaultConfig
+from config import resolve_config
+from utils import compute_text_loss, compute_mse_loss, make_collate, interleave_loaders, logger, load_checkpoint_adaptive
 
 
 def get_args():
@@ -51,79 +52,14 @@ def main():
     print(f"Tokenizer: new vocab = {new_vocab_size} (with Chinese ngrams)")
     
     # ── Model ──
-    cfg = ModelConfig(
-        dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
-        image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
-        vocab_size=new_vocab_size,
-        img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
-        use_audio=True, use_video=True,
-    )
+    cfg = resolve_config(args.resume, tokenizer,
+        defaults={'img_generation': True, 'use_audio': True, 'use_video': True})
     model = TinyMultimodal(cfg).to(device)
-    
-    # ── Load checkpoint and resize ──
+
+    # ── Load checkpoint (handles vocab/dim/layer changes automatically) ──
     if os.path.exists(args.resume):
         print(f"Loading checkpoint: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
-        state_dict = ckpt.get('model_state_dict', ckpt)
-
-        # Read old vocab size from checkpoint embedding shape (not hardcoded)
-        old_vocab_size = state_dict['text_embed.weight'].shape[0]
-        print(f"  Checkpoint vocab: {old_vocab_size} → new: {new_vocab_size}")
-
-        # Build a temp model with old vocab to load transformer weights
-        temp_cfg = ModelConfig(
-            dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
-            image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
-            vocab_size=old_vocab_size,
-            img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
-            use_audio=True, use_video=True,
-        )
-        from model import TinyMultimodal as TinyMultimodalOld
-        temp_model = TinyMultimodalOld(temp_cfg).to(device)
-
-        missing, unexpected = temp_model.load_state_dict(state_dict, strict=False)
-        print(f"  Loaded from checkpoint: missing={len(missing)}, unexpected={len(unexpected)}")
-        
-        # Now copy all non-embedding weights from temp to real model
-        # (temp has smaller vocab, so only copy layers that match)
-        model_dict = model.state_dict()
-        for key, val in temp_model.state_dict().items():
-            if key in model_dict and val.shape == model_dict[key].shape:
-                model_dict[key] = val
-            elif key in model_dict:
-                # Shape mismatch - likely embedding/lm_head
-                if 'embed' in key or 'lm_head' in key:
-                    # We'll handle this below
-                    pass
-        
-        model.load_state_dict(model_dict, strict=False)
-        
-        # Now resize embeddings
-        old_embed = temp_model.text_embed.weight.data
-        old_lm = temp_model.lm_head.weight.data
-        
-        # Copy old weights to new model
-        new_embed_data = model.text_embed.weight.data
-        new_lm_data = model.lm_head.weight.data
-        
-        new_embed_data[:old_vocab_size] = old_embed[:old_vocab_size]
-        new_lm_data[:old_vocab_size] = old_lm[:old_vocab_size]
-        
-        # Init new Chinese tokens: mean of existing embeddings + small noise
-        # This anchors new tokens near the center of the trained embedding space
-        embed_mean = old_embed.mean(dim=0, keepdim=True)  # [1, dim]
-        embed_std = old_embed.std().item()
-        noise_std = embed_std * 0.1  # small perturbation
-        torch.nn.init.normal_(new_embed_data[old_vocab_size:], mean=0.0, std=noise_std)
-        new_embed_data[old_vocab_size:] += embed_mean
-        torch.nn.init.normal_(new_lm_data[old_vocab_size:], mean=0.0, std=noise_std)
-        new_lm_data[old_vocab_size:] += embed_mean
-        
-        # Re-tie
-        model.text_embed.weight = model.lm_head.weight
-        
-        print(f"  ✓ Embeddings resized, Chinese tokens initialized")
-        del temp_model
+        load_checkpoint_adaptive(model, args.resume, device)
     else:
         print(f"  ⚠️  Checkpoint not found: {args.resume}, training from scratch")
     

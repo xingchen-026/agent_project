@@ -1,74 +1,15 @@
 #!/usr/bin/env python3
 """
-Tiny Unified Multimodal Transformer — v4.0 (Phase 4: Video Modality)
-=====================================================================
-Phase 4 adds spatiotemporal video patch processing alongside image+audio+text.
-
-Architecture:
-  [video_tokens | image_tokens | audio_patches | text_tokens] → Transformer → outputs
+Tiny Unified Multimodal Transformer
+Supports video + image + audio + text with shared transformer backbone.
+Architecture: [video_tokens | image_tokens | audio_patches | text_tokens] → Transformer → outputs
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
-
-
-@dataclass
-class ModelConfig:
-    # Architecture
-    vocab_size: int = 10000
-    dim: int = 384
-    n_layers: int = 6
-    n_heads: int = 6
-    max_seq_len: int = 1024
-
-    # Image processing
-    image_size: int = 224
-    patch_size: int = 32
-    use_type_embed: bool = True
-
-    # Regularization
-    dropout: float = 0.0
-    attention_dropout: float = 0.0
-
-    # MLP
-    mlp_multiplier: int = 4
-
-    # RoPE
-    rope_theta: float = 10000.0
-
-    # Phase 2: Image Generation
-    img_generation: bool = True
-    img_decoder_hidden: int = 512
-
-    # --- Phase 3: Audio Modality ---
-    use_audio: bool = True
-    n_mels: int = 128
-    audio_n_fft: int = 512
-    audio_hop_length: int = 128
-    audio_time_frames: int = 128
-    audio_patch_freq: int = 16
-    audio_patch_time: int = 16
-
-    # --- Phase 4: Video Modality ---
-    use_video: bool = True
-    video_frames: int = 4        # Number of frames per clip
-    video_resolution: int = 64   # H=W per frame
-    video_patch_size: int = 16   # Spatial patch (H,W)
-    video_patch_time: int = 2    # Temporal patch (frames)
-
-    def __post_init__(self):
-        self.head_dim = self.dim // self.n_heads
-        patches_per_side = self.image_size // self.patch_size
-        self.num_image_tokens = patches_per_side * patches_per_side
-        self.num_audio_tokens = (self.n_mels // self.audio_patch_freq) * \
-                                (self.audio_time_frames // self.audio_patch_time)
-        if self.use_video:
-            vfr = self.video_frames // self.video_patch_time
-            vsp = self.video_resolution // self.video_patch_size
-            self.num_video_tokens = vfr * vsp * vsp
+from config import ModelConfig  # Single source of truth for architecture config
 
 
 # ── Common Components ────────────────────────────────────────────────

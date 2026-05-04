@@ -16,9 +16,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import TinyMultimodal, ModelConfig
+from model import TinyMultimodal
 from tokenizer import SimpleTokenizer
-from utils import load_checkpoint_flexible, DefaultConfig
+from config import resolve_config
+from utils import load_checkpoint_adaptive
 
 
 def get_args():
@@ -34,19 +35,14 @@ def get_args():
 
 def load_fp32_model(checkpoint_path, device='cpu'):
     tokenizer = SimpleTokenizer(max_vocab=10000)
-    cfg = ModelConfig(
-        dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
-        image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
-        vocab_size=tokenizer.vocab_size,
-        img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
-        use_audio=True, use_video=True,
-    )
+    cfg = resolve_config(checkpoint_path, tokenizer,
+        defaults={'img_generation': True, 'use_audio': True, 'use_video': True})
     model = TinyMultimodal(cfg).to(device)
     total = sum(p.numel() for p in model.parameters())
-    print(f"Model: {total/1e6:.2f}M params")
+    print(f"Model: {total/1e6:.2f}M params ({cfg.describe()})")
 
     if os.path.exists(checkpoint_path):
-        load_checkpoint_flexible(model, checkpoint_path, device)
+        load_checkpoint_adaptive(model, checkpoint_path, device)
     model.eval()
     return model, tokenizer
 

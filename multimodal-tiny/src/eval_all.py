@@ -22,12 +22,13 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from src.model import TinyMultimodal, ModelConfig, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
+from src.model import TinyMultimodal, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
 from src.tokenizer import SimpleTokenizer
 from src.synthetic_data import SyntheticDataset
 from src.audio_synthetic import AudioDataset
 from src.video_synthetic import VideoDataset
-from src.utils import load_checkpoint_flexible, DefaultConfig
+from src.config import resolve_config
+from src.utils import load_checkpoint_adaptive
 
 
 def get_args():
@@ -408,20 +409,15 @@ def main():
     print(f"Tokenizer vocab: {tokenizer.vocab_size}")
     
     # ── Model ──
-    cfg = ModelConfig(
-        dim=DefaultConfig.dim, n_layers=DefaultConfig.n_layers,
-        image_size=DefaultConfig.image_size, patch_size=DefaultConfig.patch_size,
-        vocab_size=tokenizer.vocab_size,
-        img_generation=True, img_decoder_hidden=DefaultConfig.img_decoder_hidden,
-        use_audio=True, use_video=True,
-    )
+    cfg = resolve_config(args.checkpoint, tokenizer,
+        defaults={'img_generation': True, 'use_audio': True, 'use_video': True})
     model = TinyMultimodal(cfg).to(device)
     total = sum(p.numel() for p in model.parameters())
-    print(f"Model: {total/1e6:.2f}M parameters")
-    
+    print(f"Model: {total/1e6:.2f}M parameters ({cfg.describe()})")
+
     # ── Load checkpoint ──
     if os.path.exists(args.checkpoint):
-        info = load_checkpoint_flexible(model, args.checkpoint, device)
+        info = load_checkpoint_adaptive(model, args.checkpoint, device)
         print(f"Checkpoint info: {info}")
     else:
         print(f"⚠️  Checkpoint not found: {args.checkpoint}")

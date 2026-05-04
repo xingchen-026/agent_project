@@ -55,6 +55,8 @@ def save_checkpoint(output_dir, epoch, model, optimizer, best_loss,
         'optimizer_state_dict': optimizer.state_dict(),
         'best_loss': best_loss,
         'phase': phase,
+        'model_config': model.cfg.to_dict(),
+        'arch_version': model.cfg.arch_version,
     }
     for k, v in {**val_losses, **train_losses}.items():
         save_dict[k] = v

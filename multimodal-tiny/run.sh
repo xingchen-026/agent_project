@@ -85,8 +85,22 @@ case "$PHASE" in
       --output_dir checkpoints_phase5_v2 --log_dir logs_phase5_v2 \
       "$@"
     ;;
+  phase6)
+    echo "=== Phase 6: Scaled-Up Architecture (448d-8L-7h, ~31M) ==="
+    export CUDA_VISIBLE_DEVICES=0
+    python src/train.py \
+      --use_synthetic --use_audio --use_video \
+      --dim 448 --layers 8 --n_heads 7 \
+      --epochs 15 --batch_size 16 \
+      --train_size 10000 --val_size 500 \
+      --aud_train_size 5000 --aud_val_size 200 \
+      --vid_train_size 3000 --vid_val_size 100 \
+      --aud_loss_weight 0.5 --vid_loss_weight 0.5 --img_loss_weight 0.5 \
+      --output_dir checkpoints_phase6 --log_dir logs_phase6 \
+      "$@"
+    ;;
   *)
-    echo "Usage: ./run.sh {phase2|phase3|phase4|phase4_5|phase5|phase5_v2} [extra args]"
+    echo "Usage: ./run.sh {phase2|phase3|phase4|phase4_5|phase5|phase5_v2|phase6} [extra args]"
     exit 1
     ;;
 esac
