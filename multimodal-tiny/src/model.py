@@ -1,157 +1,32 @@
 #!/usr/bin/env python3
 """
-Tiny Unified Multimodal Transformer
-Supports video + image + audio + text with shared transformer backbone.
-Architecture: [video_tokens | image_tokens | audio_patches | text_tokens] → Transformer → outputs
+Tiny Unified Multimodal Transformer (v5.0)
+Supports video + image + audio + text with shared transformer backbone,
+KV cache, and Perceiver-style memory bank.
+
+Architecture:
+  [video | image | audio | text] → Transformer → outputs
+  [memory(16) | text]            → Transformer → outputs  (with MemoryBank)
+
+Sub-modules:
+  _components.py  — RMSNorm, RotaryEmbedding, SwiGLU, apply_rotary
+  _attention.py   — SelfAttention (KV cache), TransformerBlock
+  _memory.py      — MemoryBank (cross-modal compression)
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from config import ModelConfig  # Single source of truth for architecture config
+from config import ModelConfig
+from _components import RMSNorm, RotaryEmbedding, apply_rotary, SwiGLU
+from _attention import SelfAttention, TransformerBlock
+from _memory import MemoryBank
 
-
-# ── Common Components ────────────────────────────────────────────────
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x):
-        rms = x.pow(2).mean(-1, keepdim=True).sqrt()
-        return x / (rms + self.eps) * self.weight
-
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_len=2048, theta=10000.0):
-        super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self.max_len = max_len
-
-    def forward(self, seq_len, device):
-        t = torch.arange(seq_len, device=device).float()
-        freqs = torch.outer(t, self.inv_freq)
-        return freqs.cos(), freqs.sin()
-
-
-def apply_rotary(x, cos, sin):
-    T = x.shape[-2]
-    half = x.shape[-1] // 2
-    cos = cos[:T].reshape(1, 1, T, half).to(x.dtype)
-    sin = sin[:T].reshape(1, 1, T, half).to(x.dtype)
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
-
-
-class SelfAttention(nn.Module):
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.n_heads = cfg.n_heads
-        self.head_dim = cfg.head_dim
-        self.q_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
-        self.k_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
-        self.v_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
-        self.proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
-
-    def _proj_qkv(self, x):
-        B, T, D = x.shape
-        q = self.q_proj(x).reshape(B, T, self.n_heads, self.head_dim)
-        k = self.k_proj(x).reshape(B, T, self.n_heads, self.head_dim)
-        v = self.v_proj(x).reshape(B, T, self.n_heads, self.head_dim)
-        return q, k, v
-
-    def forward(self, x, cos, sin, mask=None, past_kv=None, use_cache=False):
-        B, T, D = x.shape
-        q, k, v = self._proj_qkv(x)
-
-        # QK norm + transpose
-        q = self.q_norm(q).transpose(1, 2)  # [B, n_heads, T, head_dim]
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # RoPE
-        q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
-
-        # KV Cache: concat with past
-        if past_kv is not None:
-            past_k, past_v = past_kv
-            k = torch.cat([past_k, k], dim=2)
-            v = torch.cat([past_v, v], dim=2)
-
-        present_kv = (k, v) if use_cache else None
-
-        # With cache (q_len < k_len), must not use causal mask
-        attn_mask = mask
-        is_causal = (mask is None and past_kv is None)
-        out = F.scaled_dot_product_attention(q, k, v,
-                                             attn_mask=attn_mask, is_causal=is_causal)
-        return self.proj(out.transpose(1, 2).reshape(B, T, D)), present_kv
-
-
-class SwiGLU(nn.Module):
-    def __init__(self, dim, hidden_mult=4):
-        super().__init__()
-        hidden = dim * hidden_mult
-        self.w1 = nn.Linear(dim, hidden, bias=False)
-        self.w2 = nn.Linear(dim, hidden, bias=False)
-        self.w3 = nn.Linear(hidden, dim, bias=False)
-
-    def forward(self, x):
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.attn_norm = RMSNorm(cfg.dim)
-        self.attn = SelfAttention(cfg)
-        self.mlp_norm = RMSNorm(cfg.dim)
-        self.mlp = SwiGLU(cfg.dim, cfg.mlp_multiplier)
-
-    def forward(self, x, cos, sin, mask=None, past_kv=None, use_cache=False):
-        attn_out, present_kv = self.attn(self.attn_norm(x), cos, sin,
-                                         mask=mask, past_kv=past_kv, use_cache=use_cache)
-        x = x + attn_out
-        x = x + self.mlp(self.mlp_norm(x))
-        return (x, present_kv) if use_cache else x
-
-
-# ── Memory Bank (Perceiver-style cross-modal compression) ────────────
-
-class MemoryBank(nn.Module):
-    """Compresses sensory patches into fixed-size memory tokens via cross-attention.
-
-    Input: sensory_patches [B, N_sensory, dim] (variable length)
-    Output: memory_tokens [B, n_mem, dim] (fixed size)
-    """
-    def __init__(self, dim, n_mem=16, n_heads=8, mlp_mult=4):
-        super().__init__()
-        self.n_mem = n_mem
-        self.memory = nn.Parameter(torch.empty(n_mem, dim))
-        torch.nn.init.normal_(self.memory, std=0.02)
-
-        self.cross_attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
-        self.norm1 = RMSNorm(dim)
-        self.norm2 = RMSNorm(dim)
-        self.mlp = SwiGLU(dim, mlp_mult)
-
-    def forward(self, sensory):
-        B = sensory.shape[0]
-        mem = self.memory.unsqueeze(0).expand(B, -1, -1)
-
-        # Cross-attention: memory attends to sensory patches
-        attn_out, _ = self.cross_attn(mem, sensory, sensory)
-        mem = self.norm1(mem + attn_out)
-
-        # FFN
-        mem = self.norm2(mem + self.mlp(mem))
-        return mem
+# Re-export for backward compat
+__all__ = ['TinyMultimodal', 'ModelConfig', 'RMSNorm', 'RotaryEmbedding',
+           'SwiGLU', 'SelfAttention', 'TransformerBlock', 'MemoryBank',
+           'apply_rotary', 'patches_to_image', 'mel_patches_to_spectrogram',
+           'video_patches_to_frames']
 
 
 # ── Decoder Heads ────────────────────────────────────────────────────
@@ -309,7 +184,8 @@ class TinyMultimodal(nn.Module):
                                           mlp_mult=cfg.mlp_multiplier)
 
         # Transformer
-        self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])
+        self.blocks = nn.ModuleList([TransformerBlock(cfg.dim, cfg.n_heads, cfg.head_dim,
+                                                       cfg.mlp_multiplier) for _ in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.dim)
 
         # LM head

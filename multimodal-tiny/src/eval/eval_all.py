@@ -22,13 +22,13 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from src.model import TinyMultimodal, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
-from src.tokenizer import SimpleTokenizer
-from src.synthetic_data import SyntheticDataset
-from src.audio_synthetic import AudioDataset
-from src.video_synthetic import VideoDataset
-from src.config import resolve_config
-from src.utils import load_checkpoint_adaptive
+from model import TinyMultimodal, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
+from tokenizer import SimpleTokenizer
+from synthetic_data import SyntheticDataset
+from audio_synthetic import AudioDataset
+from video_synthetic import VideoDataset
+from config import resolve_config
+from utils import load_checkpoint_adaptive
 
 
 def get_args():

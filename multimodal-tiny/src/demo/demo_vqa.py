@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model import TinyMultimodal
 from tokenizer import SimpleTokenizer
 from config import resolve_config
