@@ -103,7 +103,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="COCO-CN Chinese Fine-tuning")
     parser.add_argument("--resume", default="../checkpoints_phase6/best.pt")
     parser.add_argument("--coco-dir", default="../coco_data")
-    parser.add_argument("--captions-file", default="../coco_data/coco-cn-master/data/coco-cn_ext.icap2020.txt")
+    parser.add_argument("--captions-file", default="../coco_data/coco-cn_ext.icap2020.txt")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-5)
