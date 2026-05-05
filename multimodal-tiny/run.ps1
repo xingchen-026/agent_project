@@ -106,7 +106,22 @@ switch ($Phase) {
       --resume checkpoints_phase6_cn/best.pt --epochs 5 `
       @ExtraArgs
   }
+  "phase6_clip" {
+    Write-Host "=== Phase 6 + CLIP: Contrastive Pre-training ==="
+    $env:PYTHONIOENCODING = "utf-8"
+    python src/train_clip.py `
+      --resume checkpoints_phase6/best.pt --epochs 10 `
+      @ExtraArgs
+  }
+  "web" {
+    Write-Host "=== Web Demo (Gradio) ==="
+    $env:PYTHONIOENCODING = "utf-8"
+    pip install gradio -q 2>$null
+    python src/demo/web_app.py `
+      --checkpoint checkpoints_phase6_vqa/best.pt `
+      @ExtraArgs
+  }
   default {
-    Write-Host "Usage: .\run.ps1 {phase2|...|phase6|phase6_cn|phase6_vqa} [extra args]"
+    Write-Host "Usage: .\run.ps1 {phase2|...|phase6|phase6_clip|web} [extra args]"
   }
 }

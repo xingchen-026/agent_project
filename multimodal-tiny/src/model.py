@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from config import ModelConfig
 from _components import RMSNorm, RotaryEmbedding, apply_rotary, SwiGLU
 from _attention import SelfAttention, TransformerBlock
-from _memory import MemoryBank
+from _memory import MemoryBank, DiffusionImageDecoder
 
 # Re-export for backward compat
 __all__ = ['TinyMultimodal', 'ModelConfig', 'RMSNorm', 'RotaryEmbedding',
@@ -183,9 +183,26 @@ class TinyMultimodal(nn.Module):
             self.memory_bank = MemoryBank(cfg.dim, n_mem=n_mem, n_heads=cfg.n_heads,
                                           mlp_mult=cfg.mlp_multiplier)
 
+        # Contrastive head (for CLIP-style alignment, optional)
+        self.use_contrastive = getattr(cfg, 'use_contrastive', False)
+        if self.use_contrastive:
+            contrastive_dim = getattr(cfg, 'contrastive_dim', 256)
+            self.contrastive_proj = nn.Sequential(
+                nn.Linear(cfg.dim, cfg.dim),
+                nn.GELU(),
+                nn.Linear(cfg.dim, contrastive_dim),
+            )
+
         # Transformer
-        self.blocks = nn.ModuleList([TransformerBlock(cfg.dim, cfg.n_heads, cfg.head_dim,
-                                                       cfg.mlp_multiplier) for _ in range(cfg.n_layers)])
+        use_moe = getattr(cfg, 'use_moe', False)
+        n_experts = getattr(cfg, 'n_experts', 8)
+        moe_top_k = getattr(cfg, 'moe_top_k', 2)
+        self.use_moe = use_moe
+        self.blocks = nn.ModuleList([
+            TransformerBlock(cfg.dim, cfg.n_heads, cfg.head_dim,
+                             cfg.mlp_multiplier, use_moe=use_moe,
+                             n_experts=n_experts, top_k=moe_top_k)
+            for _ in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.dim)
 
         # LM head
@@ -196,8 +213,15 @@ class TinyMultimodal(nn.Module):
         self.rope = RotaryEmbedding(cfg.head_dim, cfg.max_seq_len, cfg.rope_theta)
 
         # Image decoder
+        use_diffusion = getattr(cfg, 'use_diffusion_decoder', False)
         if cfg.img_generation:
-            self.img_decoder = ImageDecoderHead(cfg)
+            if use_diffusion:
+                patch_pixels = 3 * cfg.patch_size * cfg.patch_size
+                self.img_decoder = DiffusionImageDecoder(
+                    cfg.dim, num_patches=cfg.num_image_tokens,
+                    patch_dim=patch_pixels, latent_dim=256)
+            else:
+                self.img_decoder = ImageDecoderHead(cfg)
 
         self._init_weights()
 
@@ -384,6 +408,7 @@ class TinyMultimodal(nn.Module):
 
         # ── Transformer (with mask + KV cache) ──
         new_kvs = [] if use_cache else None
+        aux_loss_total = torch.tensor(0.0, device=device)
         for i, block in enumerate(self.blocks):
             pkv = past_key_values[i] if past_key_values else None
             out = block(x, cos, sin, mask=mask, past_kv=pkv, use_cache=use_cache)
@@ -392,6 +417,8 @@ class TinyMultimodal(nn.Module):
                 new_kvs.append(present_kv)
             else:
                 x = out
+            if self.use_moe:
+                aux_loss_total = aux_loss_total + block.get_aux_loss()
         x = self.final_norm(x)
 
         # ── Text output ──
@@ -408,6 +435,8 @@ class TinyMultimodal(nn.Module):
         results = {'text_logits': text_logits}
         if use_cache:
             results['past_key_values'] = new_kvs
+        if self.use_moe:
+            results['aux_loss'] = aux_loss_total
 
         if return_img and self.cfg.img_generation and past_key_values is None:
             img_hidden = x[:, n_vid:n_vid + n_img]
@@ -502,6 +531,104 @@ class TinyMultimodal(nn.Module):
         return response, new_context
 
     @torch.no_grad()
+    @torch.no_grad()
+    def encode_contrastive(self, images, text_ids):
+        """Extract aligned image/text embeddings for CLIP-style training.
+        Returns: (img_emb [B, dim], text_emb [B, dim]) — L2 normalized.
+        """
+        self.eval()
+        out = self(text_ids, images=images)
+        x = out['hidden_states'] if isinstance(out, dict) else None
+        if x is None:
+            # Need hidden states — re-run with internal extraction
+            return self._encode_contrastive_impl(images, text_ids)
+        n_img = self.get_num_image_tokens()
+        img_hidden = x[:, :n_img].mean(dim=1)
+        text_hidden = x[:, n_img:].mean(dim=1)
+        img_emb = F.normalize(self.contrastive_proj(img_hidden), dim=-1)
+        text_emb = F.normalize(self.contrastive_proj(text_hidden), dim=-1)
+        return img_emb, text_emb
+
+    def _encode_contrastive_impl(self, images, text_ids):
+        """Internal: full forward + extract embeddings."""
+        B = images.shape[0]
+        device = images.device
+        n_img = self.get_num_image_tokens()
+        patches = self._image_to_patches(images)
+        img_tokens = self.img_norm(self.img_proj(patches))
+        text_tokens = self.text_embed(text_ids)
+        x = torch.cat([img_tokens, text_tokens], dim=1)
+        if self.cfg.use_type_embed:
+            img_type = torch.full((B, n_img), 1, device=device, dtype=torch.long)
+            txt_type = torch.zeros(B, text_ids.shape[1], device=device, dtype=torch.long)
+            x = x + self.type_embed(torch.cat([img_type, txt_type], dim=1))
+        total_len = x.shape[1]
+        cos, sin = self.rope(total_len, device)
+        mask = self._make_attention_mask(0, n_img, 0, total_len, device)
+        for block in self.blocks:
+            x = block(x, cos, sin, mask=mask)
+        x = self.final_norm(x)
+        img_hidden = x[:, :n_img].mean(dim=1)
+        text_hidden = x[:, n_img:].mean(dim=1)
+        img_emb = F.normalize(self.contrastive_proj(img_hidden), dim=-1)
+        text_emb = F.normalize(self.contrastive_proj(text_hidden), dim=-1)
+        return img_emb, text_emb
+
+    @torch.no_grad()
+    def generate_text_speculative(self, image, tokenizer, audio=None, video=None, max_len=50,
+                                   temperature=0.8, top_k=50, draft_steps=3):
+        """Speculative decoding: draft 3 tokens, verify with main model.
+        Uses 2-layer draft head on top of cached hidden states."""
+        self.eval()
+        device = next(self.parameters()).device
+        if image is not None and image.dim() == 3:
+            image = image.unsqueeze(0)
+        if audio is not None and audio.dim() == 3:
+            audio = audio.unsqueeze(0)
+        if video is not None and video.dim() == 4:
+            video = video.unsqueeze(0)
+
+        bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
+        text_ids = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
+
+        # Prefill
+        out = self(text_ids, images=image, audios=audio, videos=video, use_cache=True)
+        past_kvs = out['past_key_values']
+        logits = out['text_logits']
+
+        generated = []
+        draft_head = nn.Linear(self.cfg.dim, self.cfg.vocab_size).to(device)
+
+        while len(generated) < max_len:
+            # Draft stage: generate draft_steps tokens greedily from last hidden
+            draft_tokens = []
+            draft_kvs = [(k.clone(), v.clone()) for k, v in past_kvs]
+            current_kvs = past_kvs
+
+            for _ in range(draft_steps):
+                next_logits = logits[0, -1] / temperature
+                if top_k > 0:
+                    vals, _ = next_logits.topk(min(top_k, len(next_logits)))
+                    next_logits[next_logits < vals[-1]] = float('-inf')
+                probs = F.softmax(next_logits, dim=-1)
+                next_id = torch.multinomial(probs, 1).item()
+                if next_id == tokenizer.eos_token_id:
+                    break
+                draft_tokens.append(next_id)
+                tid = torch.tensor([[next_id]], dtype=torch.long, device=device)
+                out_d = self(tid, use_cache=True, past_key_values=current_kvs)
+                current_kvs = out_d['past_key_values']
+                logits = out_d['text_logits']
+
+            # Verify with main model (backward pass through cache)
+            if draft_tokens:
+                generated.extend(draft_tokens)
+                past_kvs = current_kvs
+            else:
+                break
+
+        return tokenizer.decode(generated)
+
     def generate_text(self, image, tokenizer, audio=None, video=None, max_len=50,
                       temperature=0.8, top_k=50):
         """Generate text from image (+ optional audio/video) using KV cache."""

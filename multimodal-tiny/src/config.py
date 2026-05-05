@@ -62,6 +62,18 @@ class ModelConfig:
     use_memory_bank: bool = True
     n_mem_tokens: int = 16
 
+    # ── Contrastive Head ──
+    use_contrastive: bool = False
+    contrastive_dim: int = 256
+
+    # ── MoE ──
+    use_moe: bool = False
+    n_experts: int = 8
+    moe_top_k: int = 2
+
+    # ── Diffusion Decoder ──
+    use_diffusion_decoder: bool = False
+
     # ── Version tracking ──
     arch_version: str = "5.0"
 

@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from _components import RMSNorm, SwiGLU, apply_rotary
+from _components import RMSNorm, SwiGLU, MoE_SwiGLU, apply_rotary
 
 
 class SelfAttention(nn.Module):
@@ -44,16 +44,30 @@ class SelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, head_dim, mlp_multiplier=4):
+    def __init__(self, dim, n_heads, head_dim, mlp_multiplier=4,
+                 use_moe=False, n_experts=8, top_k=2):
         super().__init__()
         self.attn_norm = RMSNorm(dim)
         self.attn = SelfAttention(dim, n_heads, head_dim)
         self.mlp_norm = RMSNorm(dim)
-        self.mlp = SwiGLU(dim, mlp_multiplier)
+        self.use_moe = use_moe
+        if use_moe:
+            self.mlp = MoE_SwiGLU(dim, n_experts=n_experts, top_k=top_k, expert_mult=2)
+        else:
+            self.mlp = SwiGLU(dim, mlp_multiplier)
+        self._aux_loss = torch.tensor(0.0)
 
     def forward(self, x, cos, sin, mask=None, past_kv=None, use_cache=False):
         attn_out, present_kv = self.attn(self.attn_norm(x), cos, sin,
                                          mask=mask, past_kv=past_kv, use_cache=use_cache)
         x = x + attn_out
-        x = x + self.mlp(self.mlp_norm(x))
+        if self.use_moe:
+            mlp_out, aux_loss = self.mlp(self.mlp_norm(x))
+            self._aux_loss = aux_loss
+        else:
+            mlp_out = self.mlp(self.mlp_norm(x))
+        x = x + mlp_out
         return (x, present_kv) if use_cache else x
+
+    def get_aux_loss(self):
+        return self._aux_loss
