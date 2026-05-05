@@ -27,3 +27,11 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# venv
+venv_cu118
+mvp-venv
+
+# large checkpoints
+checkpoints_phase2/
+checkpoints/
