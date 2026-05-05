@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Memory Bank + Diffusion Decoder — cross-modal compression + generation."""
+"""Memory Bank + Diffusion Decoder — cross-modal compression + generation.
+
+NOTE: When MemoryBank is active, the model's forward() compresses [video | image | audio]
+sensory tokens into fixed-size memory tokens. The sequence layout changes to
+[memory | text], which means position-based reconstruction heads (img_recon, aud_recon,
+vid_recon) will slice wrong regions of the hidden states.
+
+Workaround: set use_memory_bank=False when training reconstruction heads.
+Set use_memory_bank=True for contrastive/diffusion training (uses memory_hidden).
+"""
 
 import math
 import torch

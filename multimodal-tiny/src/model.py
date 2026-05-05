@@ -541,23 +541,11 @@ class TinyMultimodal(nn.Module):
         return response, new_context
 
     @torch.no_grad()
-    @torch.no_grad()
     def encode_contrastive(self, images, text_ids):
         """Extract aligned image/text embeddings for CLIP-style training.
         Returns: (img_emb [B, dim], text_emb [B, dim]) — L2 normalized.
         """
-        self.eval()
-        out = self(text_ids, images=images)
-        x = out['hidden_states'] if isinstance(out, dict) else None
-        if x is None:
-            # Need hidden states — re-run with internal extraction
-            return self._encode_contrastive_impl(images, text_ids)
-        n_img = self.get_num_image_tokens()
-        img_hidden = x[:, :n_img].mean(dim=1)
-        text_hidden = x[:, n_img:].mean(dim=1)
-        img_emb = F.normalize(self.contrastive_proj(img_hidden), dim=-1)
-        text_emb = F.normalize(self.contrastive_proj(text_hidden), dim=-1)
-        return img_emb, text_emb
+        return self._encode_contrastive_impl(images, text_ids)
 
     def _encode_contrastive_impl(self, images, text_ids):
         """Internal: full forward + extract embeddings."""

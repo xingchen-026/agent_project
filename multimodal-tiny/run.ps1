@@ -109,7 +109,27 @@ switch ($Phase) {
   "phase6_clip" {
     Write-Host "=== Phase 6 + CLIP: Contrastive Pre-training ==="
     $env:PYTHONIOENCODING = "utf-8"
-    python src/train_clip.py `
+    python src/train_unified.py --mode clip `
+      --resume checkpoints_phase6/best.pt --epochs 10 `
+      @ExtraArgs
+  }
+  "phase6_joint" {
+    Write-Host "=== Phase 6: CLIP+LM+Diffusion Joint Training ==="
+    $env:PYTHONIOENCODING = "utf-8"
+    python src/train_unified.py --mode joint `
+      --resume checkpoints_phase6/best.pt --epochs 15 `
+      @ExtraArgs
+  }
+  "phase6_full" {
+    Write-Host "=== Phase 6: Full Multi-Modal Joint Training (Image+Audio+Video) ==="
+    $env:PYTHONIOENCODING = "utf-8"
+    python src/train_unified.py --mode full `
+      --resume checkpoints_phase6/best.pt --epochs 20 `
+      @ExtraArgs
+  }
+  "phase6_distill" {
+    Write-Host "=== Phase 6: Knowledge Distillation (ResNet50 -> MemoryBank) ==="
+    python src/train_unified.py --mode distill `
       --resume checkpoints_phase6/best.pt --epochs 10 `
       @ExtraArgs
   }
@@ -122,6 +142,6 @@ switch ($Phase) {
       @ExtraArgs
   }
   default {
-    Write-Host "Usage: .\run.ps1 {phase2|...|phase6|phase6_clip|web} [extra args]"
+    Write-Host "Usage: .\run.ps1 {phase2|...|phase6|phase6_clip|phase6_joint|phase6_full|phase6_distill|web} [extra args]"
   }
 }
