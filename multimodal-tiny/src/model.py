@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from config import ModelConfig
 from _components import RMSNorm, RotaryEmbedding, apply_rotary, SwiGLU
 from _attention import SelfAttention, TransformerBlock
-from _memory import MemoryBank
+from _memory import MemoryBank, DiffusionImageDecoder
 
 # Re-export for backward compat
 __all__ = ['TinyMultimodal', 'ModelConfig', 'RMSNorm', 'RotaryEmbedding',
@@ -213,8 +213,15 @@ class TinyMultimodal(nn.Module):
         self.rope = RotaryEmbedding(cfg.head_dim, cfg.max_seq_len, cfg.rope_theta)
 
         # Image decoder
+        use_diffusion = getattr(cfg, 'use_diffusion_decoder', False)
         if cfg.img_generation:
-            self.img_decoder = ImageDecoderHead(cfg)
+            if use_diffusion:
+                patch_pixels = 3 * cfg.patch_size * cfg.patch_size
+                self.img_decoder = DiffusionImageDecoder(
+                    cfg.dim, num_patches=cfg.num_image_tokens,
+                    patch_dim=patch_pixels, latent_dim=256)
+            else:
+                self.img_decoder = ImageDecoderHead(cfg)
 
         self._init_weights()
 

@@ -71,6 +71,9 @@ class ModelConfig:
     n_experts: int = 8
     moe_top_k: int = 2
 
+    # ── Diffusion Decoder ──
+    use_diffusion_decoder: bool = False
+
     # ── Version tracking ──
     arch_version: str = "5.0"
 
