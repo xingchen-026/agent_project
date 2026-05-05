@@ -115,8 +115,39 @@ case "$PHASE" in
       --resume checkpoints_phase6_cn/best.pt --epochs 5 \
       "$@"
     ;;
+  phase6_clip)
+    echo "=== Phase 6: CLIP Contrastive Pre-training ==="
+    export CUDA_VISIBLE_DEVICES=0
+    export PYTHONIOENCODING=utf-8
+    python src/train_unified.py --mode clip \
+      --resume checkpoints_phase6/best.pt --epochs 10 \
+      "$@"
+    ;;
+  phase6_joint)
+    echo "=== Phase 6: CLIP+LM+Diffusion Joint Training ==="
+    export CUDA_VISIBLE_DEVICES=0
+    export PYTHONIOENCODING=utf-8
+    python src/train_unified.py --mode joint \
+      --resume checkpoints_phase6/best.pt --epochs 15 \
+      "$@"
+    ;;
+  phase6_full)
+    echo "=== Phase 6: Full Multi-Modal Joint Training (Image+Audio+Video) ==="
+    export CUDA_VISIBLE_DEVICES=0
+    export PYTHONIOENCODING=utf-8
+    python src/train_unified.py --mode full \
+      --resume checkpoints_phase6/best.pt --epochs 20 \
+      "$@"
+    ;;
+  phase6_distill)
+    echo "=== Phase 6: Knowledge Distillation (ResNet50 -> MemoryBank) ==="
+    export CUDA_VISIBLE_DEVICES=0
+    python src/train_unified.py --mode distill \
+      --resume checkpoints_phase6/best.pt --epochs 10 \
+      "$@"
+    ;;
   *)
-    echo "Usage: ./run.sh {phase2|...|phase6|phase6_cn|phase6_vqa} [extra args]"
+    echo "Usage: ./run.sh {phase2|...|phase6|phase6_cn|phase6_vqa|phase6_joint|phase6_full|phase6_clip|phase6_distill} [extra args]"
     exit 1
     ;;
 esac
