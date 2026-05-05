@@ -194,8 +194,15 @@ class TinyMultimodal(nn.Module):
             )
 
         # Transformer
-        self.blocks = nn.ModuleList([TransformerBlock(cfg.dim, cfg.n_heads, cfg.head_dim,
-                                                       cfg.mlp_multiplier) for _ in range(cfg.n_layers)])
+        use_moe = getattr(cfg, 'use_moe', False)
+        n_experts = getattr(cfg, 'n_experts', 8)
+        moe_top_k = getattr(cfg, 'moe_top_k', 2)
+        self.use_moe = use_moe
+        self.blocks = nn.ModuleList([
+            TransformerBlock(cfg.dim, cfg.n_heads, cfg.head_dim,
+                             cfg.mlp_multiplier, use_moe=use_moe,
+                             n_experts=n_experts, top_k=moe_top_k)
+            for _ in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.dim)
 
         # LM head
@@ -394,6 +401,7 @@ class TinyMultimodal(nn.Module):
 
         # ── Transformer (with mask + KV cache) ──
         new_kvs = [] if use_cache else None
+        aux_loss_total = torch.tensor(0.0, device=device)
         for i, block in enumerate(self.blocks):
             pkv = past_key_values[i] if past_key_values else None
             out = block(x, cos, sin, mask=mask, past_kv=pkv, use_cache=use_cache)
@@ -402,6 +410,8 @@ class TinyMultimodal(nn.Module):
                 new_kvs.append(present_kv)
             else:
                 x = out
+            if self.use_moe:
+                aux_loss_total = aux_loss_total + block.get_aux_loss()
         x = self.final_norm(x)
 
         # ── Text output ──
@@ -418,6 +428,8 @@ class TinyMultimodal(nn.Module):
         results = {'text_logits': text_logits}
         if use_cache:
             results['past_key_values'] = new_kvs
+        if self.use_moe:
+            results['aux_loss'] = aux_loss_total
 
         if return_img and self.cfg.img_generation and past_key_values is None:
             img_hidden = x[:, n_vid:n_vid + n_img]

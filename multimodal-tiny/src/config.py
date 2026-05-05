@@ -66,6 +66,11 @@ class ModelConfig:
     use_contrastive: bool = False
     contrastive_dim: int = 256
 
+    # ── MoE ──
+    use_moe: bool = False
+    n_experts: int = 8
+    moe_top_k: int = 2
+
     # ── Version tracking ──
     arch_version: str = "5.0"
 
