@@ -183,6 +183,16 @@ class TinyMultimodal(nn.Module):
             self.memory_bank = MemoryBank(cfg.dim, n_mem=n_mem, n_heads=cfg.n_heads,
                                           mlp_mult=cfg.mlp_multiplier)
 
+        # Contrastive head (for CLIP-style alignment, optional)
+        self.use_contrastive = getattr(cfg, 'use_contrastive', False)
+        if self.use_contrastive:
+            contrastive_dim = getattr(cfg, 'contrastive_dim', 256)
+            self.contrastive_proj = nn.Sequential(
+                nn.Linear(cfg.dim, cfg.dim),
+                nn.GELU(),
+                nn.Linear(cfg.dim, contrastive_dim),
+            )
+
         # Transformer
         self.blocks = nn.ModuleList([TransformerBlock(cfg.dim, cfg.n_heads, cfg.head_dim,
                                                        cfg.mlp_multiplier) for _ in range(cfg.n_layers)])
@@ -502,6 +512,49 @@ class TinyMultimodal(nn.Module):
         return response, new_context
 
     @torch.no_grad()
+    @torch.no_grad()
+    def encode_contrastive(self, images, text_ids):
+        """Extract aligned image/text embeddings for CLIP-style training.
+        Returns: (img_emb [B, dim], text_emb [B, dim]) — L2 normalized.
+        """
+        self.eval()
+        out = self(text_ids, images=images)
+        x = out['hidden_states'] if isinstance(out, dict) else None
+        if x is None:
+            # Need hidden states — re-run with internal extraction
+            return self._encode_contrastive_impl(images, text_ids)
+        n_img = self.get_num_image_tokens()
+        img_hidden = x[:, :n_img].mean(dim=1)
+        text_hidden = x[:, n_img:].mean(dim=1)
+        img_emb = F.normalize(self.contrastive_proj(img_hidden), dim=-1)
+        text_emb = F.normalize(self.contrastive_proj(text_hidden), dim=-1)
+        return img_emb, text_emb
+
+    def _encode_contrastive_impl(self, images, text_ids):
+        """Internal: full forward + extract embeddings."""
+        B = images.shape[0]
+        device = images.device
+        n_img = self.get_num_image_tokens()
+        patches = self._image_to_patches(images)
+        img_tokens = self.img_norm(self.img_proj(patches))
+        text_tokens = self.text_embed(text_ids)
+        x = torch.cat([img_tokens, text_tokens], dim=1)
+        if self.cfg.use_type_embed:
+            img_type = torch.full((B, n_img), 1, device=device, dtype=torch.long)
+            txt_type = torch.zeros(B, text_ids.shape[1], device=device, dtype=torch.long)
+            x = x + self.type_embed(torch.cat([img_type, txt_type], dim=1))
+        total_len = x.shape[1]
+        cos, sin = self.rope(total_len, device)
+        mask = self._make_attention_mask(0, n_img, 0, total_len, device)
+        for block in self.blocks:
+            x = block(x, cos, sin, mask=mask)
+        x = self.final_norm(x)
+        img_hidden = x[:, :n_img].mean(dim=1)
+        text_hidden = x[:, n_img:].mean(dim=1)
+        img_emb = F.normalize(self.contrastive_proj(img_hidden), dim=-1)
+        text_emb = F.normalize(self.contrastive_proj(text_hidden), dim=-1)
+        return img_emb, text_emb
+
     def generate_text(self, image, tokenizer, audio=None, video=None, max_len=50,
                       temperature=0.8, top_k=50):
         """Generate text from image (+ optional audio/video) using KV cache."""

@@ -62,6 +62,10 @@ class ModelConfig:
     use_memory_bank: bool = True
     n_mem_tokens: int = 16
 
+    # ── Contrastive Head ──
+    use_contrastive: bool = False
+    contrastive_dim: int = 256
+
     # ── Version tracking ──
     arch_version: str = "5.0"
 
