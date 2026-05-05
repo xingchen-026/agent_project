@@ -298,7 +298,8 @@ class TinyMultimodal(nn.Module):
     def forward(self, text_ids, images=None, audios=None, videos=None,
                 return_img=False, return_audio=False, return_video=False,
                 img_gen_mode=False, audio_gen_mode=False,
-                past_key_values=None, use_cache=False):
+                past_key_values=None, use_cache=False,
+                return_memory_hidden=False):
         B = text_ids.shape[0]
         device = text_ids.device
         n_img = self.get_num_image_tokens()
@@ -421,9 +422,18 @@ class TinyMultimodal(nn.Module):
                 aux_loss_total = aux_loss_total + block.get_aux_loss()
         x = self.final_norm(x)
 
+        # ── Results dict ──
+        results = {}
+
+        # ── Memory hidden states (for CLIP/diffusion losses) ──
+        if return_memory_hidden and self.use_memory_bank:
+            n_mem = self.memory_bank.n_mem
+            results['memory_hidden'] = x[:, :n_mem]
+            results['text_hidden'] = x[:, n_mem:]
+
         # ── Text output ──
         if past_key_values is not None:
-            text_logits = self.lm_head(x)  # only text tokens present
+            text_logits = self.lm_head(x)
         elif self.use_memory_bank:
             n_sensory = self.memory_bank.n_mem
             text_logits = self.lm_head(x[:, n_sensory:])
@@ -432,7 +442,7 @@ class TinyMultimodal(nn.Module):
             text_logits = self.lm_head(x[:, n_sensory:])
 
         # ── Reconstruction outputs ──
-        results = {'text_logits': text_logits}
+        results['text_logits'] = text_logits
         if use_cache:
             results['past_key_values'] = new_kvs
         if self.use_moe:
@@ -453,7 +463,7 @@ class TinyMultimodal(nn.Module):
             results['vid_recon'] = self.video_decoder(vid_hidden)
             results['target_vid'] = target_patches.get('video')
 
-        if return_img or return_audio or return_video or use_cache:
+        if return_img or return_audio or return_video or use_cache or return_memory_hidden:
             return results
         return text_logits
 
