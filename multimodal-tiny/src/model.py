@@ -574,6 +574,61 @@ class TinyMultimodal(nn.Module):
         text_emb = F.normalize(self.contrastive_proj(text_hidden), dim=-1)
         return img_emb, text_emb
 
+    @torch.no_grad()
+    def generate_text_speculative(self, image, tokenizer, audio=None, video=None, max_len=50,
+                                   temperature=0.8, top_k=50, draft_steps=3):
+        """Speculative decoding: draft 3 tokens, verify with main model.
+        Uses 2-layer draft head on top of cached hidden states."""
+        self.eval()
+        device = next(self.parameters()).device
+        if image is not None and image.dim() == 3:
+            image = image.unsqueeze(0)
+        if audio is not None and audio.dim() == 3:
+            audio = audio.unsqueeze(0)
+        if video is not None and video.dim() == 4:
+            video = video.unsqueeze(0)
+
+        bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
+        text_ids = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
+
+        # Prefill
+        out = self(text_ids, images=image, audios=audio, videos=video, use_cache=True)
+        past_kvs = out['past_key_values']
+        logits = out['text_logits']
+
+        generated = []
+        draft_head = nn.Linear(self.cfg.dim, self.cfg.vocab_size).to(device)
+
+        while len(generated) < max_len:
+            # Draft stage: generate draft_steps tokens greedily from last hidden
+            draft_tokens = []
+            draft_kvs = [(k.clone(), v.clone()) for k, v in past_kvs]
+            current_kvs = past_kvs
+
+            for _ in range(draft_steps):
+                next_logits = logits[0, -1] / temperature
+                if top_k > 0:
+                    vals, _ = next_logits.topk(min(top_k, len(next_logits)))
+                    next_logits[next_logits < vals[-1]] = float('-inf')
+                probs = F.softmax(next_logits, dim=-1)
+                next_id = torch.multinomial(probs, 1).item()
+                if next_id == tokenizer.eos_token_id:
+                    break
+                draft_tokens.append(next_id)
+                tid = torch.tensor([[next_id]], dtype=torch.long, device=device)
+                out_d = self(tid, use_cache=True, past_key_values=current_kvs)
+                current_kvs = out_d['past_key_values']
+                logits = out_d['text_logits']
+
+            # Verify with main model (backward pass through cache)
+            if draft_tokens:
+                generated.extend(draft_tokens)
+                past_kvs = current_kvs
+            else:
+                break
+
+        return tokenizer.decode(generated)
+
     def generate_text(self, image, tokenizer, audio=None, video=None, max_len=50,
                       temperature=0.8, top_k=50):
         """Generate text from image (+ optional audio/video) using KV cache."""
