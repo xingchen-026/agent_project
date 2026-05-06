@@ -7,6 +7,7 @@ Modes:
   clip       CLIP contrastive pre-training on COCO (replaces train_clip.py)
   distill    ResNet50 → MemoryBank knowledge distillation (replaces train_distill.py)
   base       From-scratch synthetic multi-modal training (replaces train.py)
+  coco_lm    Pure COCO LM training — image→text, no reconstruction (P0 generation quality)
 
 Usage:
   python train_unified.py --mode full --resume ../checkpoints_phase6/best.pt --epochs 20
@@ -49,7 +50,7 @@ def get_args():
     p = argparse.ArgumentParser(description="Unified Multi-Modal Training")
     # Mode
     p.add_argument("--mode", required=True,
-                   choices=["full", "joint", "clip", "distill", "base"])
+                   choices=["full", "joint", "clip", "distill", "base", "coco_lm", "audio_clip"])
     # Common
     p.add_argument("--resume", default="../checkpoints_phase6/best.pt")
     p.add_argument("--epochs", type=int, default=20)
@@ -61,7 +62,11 @@ def get_args():
     # COCO data
     p.add_argument("--coco-dir", default="../coco_data")
     p.add_argument("--ann-file", default="../coco_data/captions_val2017.json")
+    p.add_argument("--val-ann-file", default="",
+                   help="Separate validation annotation file (for train/val split)")
     p.add_argument("--max-images", type=int, default=2000)
+    p.add_argument("--no-pre-cache", action="store_true",
+                   help="Stream images from disk (for large datasets >5000 images)")
     # Modality flags
     p.add_argument("--no-audio", action="store_true")
     p.add_argument("--no-video", action="store_true")
@@ -70,6 +75,10 @@ def get_args():
     p.add_argument("--clip-weight", type=float, default=1.0)
     p.add_argument("--lm-weight", type=float, default=0.5)
     p.add_argument("--diff-weight", type=float, default=0.1)
+    p.add_argument("--max-captions", type=int, default=2,
+                   help="Captions per image (1 = more image diversity)")
+    p.add_argument("--img-lm-weight", type=float, default=0.5)
+    p.add_argument("--img-rec-weight", type=float, default=0.3)
     # CLIP specific
     p.add_argument("--temperature", type=float, default=0.07)
     # Base training
@@ -78,6 +87,9 @@ def get_args():
     p.add_argument("--n-heads", type=int, default=6)
     p.add_argument("--train-size", type=int, default=10000)
     p.add_argument("--val-size", type=int, default=500)
+    # Audio-CLIP
+    p.add_argument("--audio-dir", default="../esc50_data/audio")
+    p.add_argument("--esc50-meta", default="../esc50_data/meta/esc50.csv")
     # Distill
     p.add_argument("--teacher-model", default="resnet50")
     return p.parse_args()
@@ -178,7 +190,7 @@ def setup_full(args, tokenizer, device):
     print("\nBuilding datasets...")
     img_ds = CocoCaptionDataset(args.coco_dir, args.ann_file,
                                  image_size=cfg.image_size, max_images=args.max_images,
-                                 max_captions_per_image=2, pre_cache=True, seed=args.seed)
+                                 max_captions_per_image=args.max_captions, pre_cache=not args.no_pre_cache, seed=args.seed)
     img_train, img_val = split_dataset(img_ds, seed=args.seed)
     img_loader = DataLoader(img_train, args.batch_size, shuffle=True,
                             collate_fn=ImageCaptionCollate(), num_workers=0, drop_last=True)
@@ -205,8 +217,9 @@ def setup_full(args, tokenizer, device):
     total_steps = len(img_loader) * args.epochs
     scheduler = build_scheduler(optimizer, total_steps, warmup_ratio=0.03, min_warmup=min(100, total_steps // 10))
 
-    # Loss weights
-    W = {'img_lm': 0.5, 'img_rec': 0.3, 'aud_lm': 0.3, 'aud_rec': 0.1,
+    # Loss weights (CLI-overridable for image LM/rec)
+    W = {'img_lm': args.img_lm_weight, 'img_rec': args.img_rec_weight,
+         'aud_lm': 0.3, 'aud_rec': 0.1,
          'vid_lm': 0.2, 'vid_rec': 0.1}
 
     # Mutable state for cycling audio/video iterators
@@ -306,7 +319,7 @@ def setup_joint(args, tokenizer, device):
     from data_lib import PadCollate
     ds = CocoCaptionDataset(args.coco_dir, args.ann_file,
                              image_size=cfg.image_size, max_images=args.max_images,
-                             max_captions_per_image=3, pre_cache=True, seed=args.seed)
+                             max_captions_per_image=3, pre_cache=not args.no_pre_cache, seed=args.seed)
     train_ds, val_ds = split_dataset(ds, val_frac=0.05, seed=args.seed)
     collate = PadCollate(tokenizer, max_len=48, add_bos=True, return_dict=False)
     train_loader = DataLoader(train_ds, args.batch_size, shuffle=True,
@@ -390,7 +403,7 @@ def setup_clip(args, tokenizer, device):
     print("\nBuilding COCO contrastive dataset...")
     ds = CocoCaptionDataset(args.coco_dir, args.ann_file,
                              image_size=cfg.image_size, max_images=args.max_images,
-                             max_captions_per_image=5, pre_cache=True, seed=args.seed)
+                             max_captions_per_image=5, pre_cache=not args.no_pre_cache, seed=args.seed)
 
     # Group by image path for proper split
     img_to_pairs = {}
@@ -499,7 +512,7 @@ def setup_distill(args, tokenizer, device):
     # Data: images only
     ds = CocoCaptionDataset(args.coco_dir, args.ann_file,
                              image_size=cfg.image_size, max_images=args.max_images,
-                             max_captions_per_image=1, pre_cache=True, seed=args.seed)
+                             max_captions_per_image=1, pre_cache=not args.no_pre_cache, seed=args.seed)
     train_ds, val_ds = split_dataset(ds, val_frac=0.05, min_val=10, seed=args.seed)
     train_loader = DataLoader(train_ds, args.batch_size, shuffle=True,
                                collate_fn=ImageCaptionCollate(), num_workers=0, drop_last=True)
@@ -570,6 +583,143 @@ def setup_distill(args, tokenizer, device):
         return {'val_cosine': cos_sim_total / max(n, 1)}
 
     return (model, distill_head), train_loader, optimizer, scheduler, train_step, val_step
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Mode: AUDIO_CLIP — Audio-Text Contrastive Learning on ESC-50
+# Purpose: P1 audio understanding via CLIP-style alignment
+# ═════════════════════════════════════════════════════════════════════
+
+def setup_audio_clip(args, tokenizer, device):
+    """Audio-text contrastive learning on ESC-50 environmental sounds."""
+    import csv
+    from audio_synthetic import waveform_to_mel
+
+    cfg = resolve_config(args.resume, tokenizer, defaults={
+        'img_generation': True,   # keep img for shared transformer
+        'use_audio': True,
+        'use_video': False,
+        'use_memory_bank': False,
+        'use_contrastive': True,
+        'contrastive_dim': 256,
+    })
+    model = TinyMultimodal(cfg).to(device)
+    print(f"Model: {count_params(model):.2f}M ({cfg.describe()})  Audio-Text Contrastive")
+    load_checkpoint_adaptive(model, args.resume, device)
+
+    # Parse ESC-50 metadata: filename → category name
+    print("\nLoading ESC-50 metadata...")
+    file_to_category = {}
+    with open(args.esc50_meta) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            file_to_category[row['filename']] = row['category']
+
+    # Build audio-text pairs
+    print("Loading audio clips...")
+    audio_dir = Path(args.audio_dir)
+    samples = []
+    for wav_path in sorted(audio_dir.glob('*.wav')):
+        fname = wav_path.name
+        if fname not in file_to_category:
+            continue
+        try:
+            import scipy.io.wavfile as wav
+            sr, data = wav.read(str(wav_path))
+            if data.dtype == np.int16:
+                data = data.astype(np.float32) / 32768.0
+            data = torch.from_numpy(data).float()
+            if data.dim() == 2:
+                data = data.mean(dim=1)
+            if sr != 16000:
+                import torchaudio
+                resampler = torchaudio.transforms.Resample(sr, 16000)
+                data = resampler(data.unsqueeze(0))[0]
+            center = len(data) // 2
+            half = 8000
+            start = max(0, center - half)
+            end = min(len(data), center + half)
+            data = data[start:end]
+            if len(data) >= 8000:
+                mel = waveform_to_mel(data)
+                category = file_to_category[fname].replace('_', ' ')
+                samples.append((mel, f"the sound of {category}"))
+        except Exception:
+            continue
+
+    print(f"  ESC-50: {len(samples)} audio-text pairs ({len(set(c for _, c in samples))} categories)")
+
+    # Split by ESC-50 folds (fold 5 = val)
+    train_samples, val_samples = [], []
+    for s in samples:
+        # Get fold from mel tensor shape (hack: re-derive from path)
+        pass
+
+    # Simple random split
+    from data_lib import split_dataset
+    from torch.utils.data import Dataset
+
+    class AudioTextDataset(Dataset):
+        def __init__(self, samples):
+            self.samples = samples
+        def __len__(self):
+            return len(self.samples)
+        def __getitem__(self, idx):
+            return self.samples[idx]
+
+    ds = AudioTextDataset(samples)
+    train_ds, val_ds = split_dataset(ds, val_frac=0.15, min_val=20, seed=args.seed)
+
+    train_loader = DataLoader(train_ds, args.batch_size, shuffle=True,
+                               collate_fn=ImageCaptionCollate(), num_workers=0, drop_last=True)
+    val_loader = DataLoader(val_ds, args.batch_size, shuffle=False,
+                             collate_fn=ImageCaptionCollate(), num_workers=0)
+    print(f"  Train: {len(train_ds)}  Val: {len(val_ds)}")
+
+    # Optimizer
+    optimizer = build_new_module_optimizer(model, args.lr, ['contrastive_proj'])
+    total_steps = len(train_loader) * args.epochs
+    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
+    print(f"  LR: proj={args.lr * 5:.1e}, body={args.lr:.1e}")
+
+    def train_step(model, batch, device, optimizer, scheduler):
+        audios, captions = batch
+        audios = audios.to(device)
+        bos_id = 2
+        encoded = tokenizer(list(captions), padding=True, truncation=True,
+                            max_length=48, return_tensors=True)
+        text_ids = torch.cat([
+            torch.full((len(captions), 1), bos_id, dtype=torch.long),
+            encoded['input_ids']
+        ], dim=1)[:, :48].to(device)
+
+        aud_emb, text_emb = model._encode_contrastive_impl_audio(audios, text_ids)
+        loss = clip_contrastive_loss(aud_emb, text_emb, args.temperature)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        return loss.item()
+
+    @torch.no_grad()
+    def val_step(model, device):
+        all_aud, all_txt = [], []
+        for audios, captions in val_loader:
+            audios = audios.to(device)
+            bos_id = 2
+            encoded = tokenizer(list(captions), padding=True, truncation=True,
+                                max_length=48, return_tensors=True)
+            text_ids = torch.cat([
+                torch.full((len(captions), 1), bos_id, dtype=torch.long),
+                encoded['input_ids']
+            ], dim=1)[:, :48].to(device)
+            ae, te = model._encode_contrastive_impl_audio(audios, text_ids)
+            all_aud.append(ae)
+            all_txt.append(te)
+        return retrieval_accuracy(torch.cat(all_aud), torch.cat(all_txt))
+
+    return model, train_loader, optimizer, scheduler, train_step, val_step
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -679,6 +829,93 @@ def setup_base(args, tokenizer, device):
 
 
 # ═════════════════════════════════════════════════════════════════════
+# Mode: COCO_LM — Pure COCO Image→Text LM Training
+# Purpose: improve generation quality (P0 bottleneck fix)
+# ═════════════════════════════════════════════════════════════════════
+
+def setup_coco_lm(args, tokenizer, device):
+    """Pure LM training on COCO captions — no reconstruction, no other modalities.
+    Maximizes compute spent on improving text generation quality.
+    """
+    cfg = resolve_config(args.resume, tokenizer, defaults={
+        'img_generation': False,   # No reconstruction needed
+        'use_audio': False,
+        'use_video': False,
+        'use_memory_bank': False,
+        'use_contrastive': False,
+        'use_diffusion_decoder': False,
+    })
+    model = TinyMultimodal(cfg).to(device)
+    print(f"Model: {count_params(model):.2f}M ({cfg.describe()})")
+    print(f"  Mode: LM-only (no reconstruction, no audio/video)")
+    load_checkpoint_adaptive(model, args.resume, device)
+
+    # Data: COCO only (supports separate train/val annotation files)
+    print("\nBuilding COCO dataset...")
+    if args.val_ann_file and os.path.exists(args.val_ann_file):
+        # Separate train/val annotation files
+        print(f"  Train ann: {args.ann_file}")
+        print(f"  Val ann:   {args.val_ann_file}")
+        train_ds = CocoCaptionDataset(args.coco_dir, args.ann_file,
+                                       image_size=cfg.image_size, max_images=args.max_images,
+                                       max_captions_per_image=args.max_captions, pre_cache=not args.no_pre_cache, seed=args.seed)
+        val_ds = CocoCaptionDataset(args.coco_dir, args.val_ann_file,
+                                     image_size=cfg.image_size, max_images=min(args.max_images // 4, 5000),
+                                     max_captions_per_image=args.max_captions, pre_cache=not args.no_pre_cache, seed=args.seed)
+    else:
+        # Single annotation file, random split
+        ds = CocoCaptionDataset(args.coco_dir, args.ann_file,
+                                 image_size=cfg.image_size, max_images=args.max_images,
+                                 max_captions_per_image=args.max_captions, pre_cache=not args.no_pre_cache, seed=args.seed)
+        train_ds, val_ds = split_dataset(ds, val_frac=0.05, min_val=32, seed=args.seed)
+
+    train_loader = DataLoader(train_ds, args.batch_size, shuffle=True,
+                               collate_fn=ImageCaptionCollate(), num_workers=0, drop_last=True)
+    val_loader = DataLoader(val_ds, args.batch_size, shuffle=False,
+                             collate_fn=ImageCaptionCollate(), num_workers=0)
+    print(f"  Train: {len(train_ds)} pairs ({len(train_loader)} batches)")
+    print(f"  Val: {len(val_ds)} pairs ({len(val_loader)} batches)")
+
+    # Optimizer: moderate LR for LM fine-tuning
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.05, betas=(0.9, 0.95))
+    total_steps = len(train_loader) * args.epochs
+    scheduler = build_scheduler(optimizer, total_steps, warmup_ratio=0.03, min_warmup=min(100, total_steps // 10))
+    print(f"  LR: {args.lr:.1e}, warmup, cosine decay")
+
+    def train_step(model, batch, device, optimizer, scheduler):
+        images, captions = batch
+        images = images.to(device)
+        text_ids, lengths = encode_captions(tokenizer, captions, device=device)
+
+        out = model(text_ids, images=images)
+        logits = out if isinstance(out, torch.Tensor) else out['text_logits']
+        loss = lm_loss(logits, text_ids, lengths)
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        return loss.item()
+
+    @torch.no_grad()
+    def val_step(model, device):
+        total = 0.0
+        n = 0
+        for images, captions in val_loader:
+            images = images.to(device)
+            text_ids, lengths = encode_captions(tokenizer, captions, device=device)
+            out = model(text_ids, images=images)
+            logits = out if isinstance(out, torch.Tensor) else out['text_logits']
+            current = lm_loss(logits, text_ids, lengths).item()
+            total += current * len(captions)
+            n += len(captions)
+        return {'val_loss': total / max(n, 1)}
+
+    return model, train_loader, optimizer, scheduler, train_step, val_step
+
+
+# ═════════════════════════════════════════════════════════════════════
 # Main Entry Point
 # ═════════════════════════════════════════════════════════════════════
 
@@ -697,6 +934,8 @@ def main():
         'clip': setup_clip,
         'distill': setup_distill,
         'base': setup_base,
+        'coco_lm': setup_coco_lm,
+        'audio_clip': setup_audio_clip,
     }
 
     if args.mode not in setup_fns:

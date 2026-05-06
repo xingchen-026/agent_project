@@ -17,13 +17,16 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model import TinyMultimodal, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
 from tokenizer import SimpleTokenizer
 from synthetic_data import SyntheticDataset
 from audio_synthetic import AudioDataset
 from video_synthetic import VideoDataset
-from config import resolve_config
-from utils import load_checkpoint_adaptive
+from eval_lib import load_eval_model
+from data_lib import tensor_to_numpy
+from losses import compute_psnr, compute_snr
+from training import print_header
 
 
 def get_args():
@@ -39,42 +42,6 @@ def get_args():
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
-
-# ── Device & Model Setup ────────────────────────────────────────────
-
-def load_model(checkpoint_path):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = SimpleTokenizer(max_vocab=10000)
-    cfg = resolve_config(checkpoint_path, tokenizer,
-        defaults={'img_generation': True, 'use_audio': True, 'use_video': True})
-    model = TinyMultimodal(cfg).to(device)
-    total = sum(p.numel() for p in model.parameters())
-    info = {}
-    if os.path.exists(checkpoint_path):
-        info = load_checkpoint_adaptive(model, checkpoint_path, device)
-    print(f"Model: {total/1e6:.2f}M parameters ({cfg.describe()}, {'CUDA' if torch.cuda.is_available() else 'CPU'})")
-    return model, tokenizer, device
-
-
-# ── Utility Functions ───────────────────────────────────────────────
-
-def tensor_to_numpy(tensor):
-    arr = ((tensor.detach().cpu().numpy() + 1) / 2).clip(0, 1)
-    if arr.ndim == 3 and arr.shape[0] in (1, 3):
-        arr = arr.transpose(1, 2, 0)
-    return arr
-
-def compute_psnr(orig, recon, max_val=2.0):
-    mse = F.mse_loss(orig, recon).item()
-    if mse < 1e-10:
-        return float('inf')
-    return 10 * math.log10((max_val ** 2) / mse)
-
-def print_header(text):
-    w = 60
-    print(f"\n{'='*w}")
-    print(f"  {text}")
-    print(f"{'='*w}")
 
 def print_result(label, value, unit=""):
     print(f"  {label}: {value}{unit}")
@@ -587,7 +554,7 @@ def main():
     args.output = Path(args.output)
     args.output.mkdir(parents=True, exist_ok=True)
     
-    model, tokenizer, device = load_model(args.checkpoint)
+    model, tokenizer, device = load_eval_model(args.checkpoint)
     
     if args.test_all:
         results = {}
