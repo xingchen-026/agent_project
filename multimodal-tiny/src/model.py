@@ -572,6 +572,31 @@ class TinyMultimodal(nn.Module):
         text_emb = F.normalize(self.contrastive_proj(text_hidden), dim=-1)
         return img_emb, text_emb
 
+    def _encode_contrastive_impl_audio(self, audios, text_ids):
+        """Internal: full forward for audio-text contrastive embedding extraction."""
+        B = audios.shape[0]
+        device = audios.device
+        n_aud = self.get_num_audio_tokens(audios)
+        aud_patches = self._spectrogram_to_patches(audios)
+        aud_tokens = self.audio_norm(self.audio_proj(aud_patches))
+        text_tokens = self.text_embed(text_ids)
+        x = torch.cat([aud_tokens, text_tokens], dim=1)
+        if self.cfg.use_type_embed:
+            aud_type = torch.full((B, n_aud), 2, device=device, dtype=torch.long)
+            txt_type = torch.zeros(B, text_ids.shape[1], device=device, dtype=torch.long)
+            x = x + self.type_embed(torch.cat([aud_type, txt_type], dim=1))
+        total_len = x.shape[1]
+        cos, sin = self.rope(total_len, device)
+        mask = self._make_attention_mask(0, 0, n_aud, total_len, device)
+        for block in self.blocks:
+            x = block(x, cos, sin, mask=mask)
+        x = self.final_norm(x)
+        aud_hidden = x[:, :n_aud].mean(dim=1)
+        text_hidden = x[:, n_aud:].mean(dim=1)
+        aud_emb = F.normalize(self.contrastive_proj(aud_hidden), dim=-1)
+        text_emb = F.normalize(self.contrastive_proj(text_hidden), dim=-1)
+        return aud_emb, text_emb
+
     @torch.no_grad()
     def generate_text_speculative(self, image, tokenizer, audio=None, video=None, max_len=50,
                                    temperature=0.8, top_k=50, draft_steps=3):

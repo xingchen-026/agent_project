@@ -176,9 +176,11 @@ def main():
 
     # ── Reference model (frozen) ──
     print("\nLoading reference model...")
+    # Respect the checkpoint's modality config — don't override architecture
     cfg = resolve_config(args.resume, tokenizer, defaults={
-        'img_generation': True, 'use_audio': True, 'use_video': True,
-        'use_memory_bank': False, 'use_contrastive': False, 'use_diffusion_decoder': False,
+        'use_memory_bank': False,
+        'use_contrastive': False,
+        'use_diffusion_decoder': False,
     })
     ref_model = TinyMultimodal(cfg).to(device)
     load_checkpoint_adaptive(ref_model, args.resume, device)
@@ -197,7 +199,8 @@ def main():
     # ── Data ──
     print("\nBuilding DPO dataset...")
     ds = DpoDataset(args.coco_dir, args.ann_file, image_size=cfg.image_size,
-                    max_images=args.max_images, seed=args.seed, pre_cache=True)
+                    max_images=args.max_images, seed=args.seed,
+                    pre_cache=(args.max_images <= 5000))
     train_ds, val_ds = split_dataset(ds, val_frac=0.05, min_val=16, seed=args.seed)
 
     def dpo_collate(batch):

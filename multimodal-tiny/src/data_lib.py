@@ -65,14 +65,11 @@ class CocoCaptionDataset(Dataset):
 
         coco_dir = Path(coco_dir)
         # Detect split directory (val2017, val2014, train2014, etc.)
-        if (coco_dir / 'val2017').exists():
-            self.img_dir = coco_dir / 'val2017'
-        elif (coco_dir / 'val2014').exists():
-            self.img_dir = coco_dir / 'val2014'
-        elif (coco_dir / 'train2014').exists():
-            self.img_dir = coco_dir / 'train2014'
-        else:
-            self.img_dir = coco_dir
+        # Search multiple directories for images
+        search_dirs = []
+        for d in ['val2017', 'train2017', 'val2014', 'train2014']:
+            if (coco_dir / d).exists():
+                search_dirs.append(coco_dir / d)
 
         self.image_size = image_size
         self.pre_cache = pre_cache
@@ -86,11 +83,19 @@ class CocoCaptionDataset(Dataset):
         self.samples = []
         self._cache = {} if pre_cache else None
 
-        print(f"  Loading {len(img_ids)} COCO images...")
+        print(f"  Loading {len(img_ids)} COCO images (searching: {[d.name for d in search_dirs]})...")
+        missing = 0
         for i, img_id in enumerate(img_ids):
             info = coco.imgs[img_id]
-            path = self.img_dir / info['file_name']
-            if not path.exists():
+            # Try each search directory
+            path = None
+            for d in search_dirs:
+                candidate = d / info['file_name']
+                if candidate.exists():
+                    path = candidate
+                    break
+            if path is None:
+                missing += 1
                 continue
 
             if pre_cache:
@@ -106,7 +111,8 @@ class CocoCaptionDataset(Dataset):
             if (i + 1) % 500 == 0:
                 print(f"    {i + 1}/{len(img_ids)}")
 
-        print(f"  COCO: {len(self.samples)} pairs ({len(set(p for p, _ in self.samples))} images)")
+        if missing:
+            print(f"  COCO: {len(self.samples)} pairs ({len(set(p for p, _ in self.samples))} images, {missing} missing)")
 
     def __len__(self):
         return len(self.samples)
