@@ -1,6 +1,6 @@
 # 开发路线图
 
-当前状态：**Phase 6+ Generation** — 30.97M 参数，全模态 + 中文 + CLIP + MoE + Diffusion + DPO
+当前状态：**Phase 6+ Generation** — 30.97M 参数，COCO train2017 LM val=0.98，生成完整英语句子
 
 ## 完成情况总览
 
@@ -19,10 +19,11 @@
 | 任务 | 状态 | 结果 |
 |------|:----:|------|
 | 2.1 CLIP 对比预训练 | ✅ | R@1=20% (随机基线 1%), 10 epochs |
-| 2.2 ResNet50 知识蒸馏 | ✅ | cos=0.45 (基线 0.41), MemoryBank 对齐 |
-| 2.3 联合训练 (CLIP+LM+Diff) | ✅ | CLIP 98%, LM 67%, val 37% 提升 |
-| 2.4 全模态联合训练 | ✅ | 20 epoch, img=0.53, aud=0.006, vid=0.002, val=1.24 |
-| 2.5 DPO 对齐训练 | ✅ | val_acc=65.4% (随机 50%), 5 epochs |
+| 2.2 ResNet50 知识蒸馏 | ✅ | cos=0.45 (基线 0.41) |
+| 2.3 CLIP+LM+Diff 联合 | ✅ | CLIP 98%, LM 67%, val 37% 提升 |
+| 2.4 Audio-CLIP 对比学习 | ✅ | **R@1=88%**, ESC-50 50类, 10 epochs |
+| **2.5 COCO LM 大规模训练** | ✅ | **val 1.24→0.98**, train2017 50K图, 20 epochs |
+| **2.6 DPO v3 对齐** | ✅ | **val_acc 65.4%→70.7%**, 语法正确句子首次出现 |
 
 ### 方向三：中文效果 ✅
 
@@ -32,71 +33,89 @@
 | 3.2 COCO-CN 真实中文 | ✅ | val_loss=2.03 (1500 张图) |
 | 3.3 VQA 指令微调 | ✅ | 10 种中文问答模板 |
 
-### 方向四：模块整合 ✅
+### 方向四：工程整合 ✅
 
 | 任务 | 状态 | 结果 |
 |------|:----:|------|
-| 4.1 共享库模块 | ✅ | losses/data_lib/training/eval_lib (1731 行) |
-| 4.2 统一训练入口 | ✅ | train_unified.py --mode (full/joint/clip/distill/base) |
+| 4.1 共享库模块 | ✅ | losses/data_lib/training/eval_lib (1731行) |
+| 4.2 统一训练入口 | ✅ | train_unified.py 7种模式 |
 | 4.3 运行脚本同步 | ✅ | run.ps1/run.sh 一致 |
+| 4.4 流式数据加载 | ✅ | --no-pre-cache 支持大数据集 |
+| 4.5 多目录图像搜索 | ✅ | val2017/train2017/val2014/train2014 自动查找 |
+| 4.6 Eval/Demo 重构 | 🔄 | inference_demo 已迁移到 eval_lib |
 
 ### 里程碑
 
 | 里程碑 | 目标 | 实际 |
 |--------|------|:----:|
 | 中文 val_text ≤ 0.05 | 中文效果 | ✅ 0.048 |
-| 全模态联合训练 | 真实 COCO 数据 | ✅ val=1.24 |
-| DPO 偏好对齐 | val_acc > 60% | ✅ 65.4% |
-| COCO BLEU-1 ≥ 0.15 | 图像描述 | ❌ 合成数据限制 |
-| INT8 ≤ 20MB | 量化部署 | ⚠️ 32MB |
+| COCO LM 泛化训练 | val < 1.0 无过拟合 | ✅ 0.98 |
+| DPO 偏好对齐 | val_acc > 70% | ✅ 70.7% |
+| 语法正确句子 | 生成可读英语 | ✅ (DPO v3) |
+| Audio-CLIP 音频对齐 | R@1 > 80% | ✅ 88% |
 | 模块整合 | 消除重复代码 | ✅ 10→1 脚本 |
+| COCO BLEU-1 ≥ 0.15 | 图像描述 | ❌ 内容准确性不足 |
+| INT8 ≤ 20MB | 量化部署 | ⚠️ 32MB |
+| train2017 全部 74K 图 | 更大规模训练 | ❌ |
 
 ---
 
-## Phase 6+ 全模态联合训练结果 (20 epochs)
+## COCO LM 大规模训练 (P0 突破)
 
-| Epoch | img_lm | aud_lm | vid_lm | val_loss |
-|-------|--------|--------|--------|----------|
-| 1 | 2.50 | 0.41 | 0.26 | 2.04 |
-| 5 | 0.92 | 0.007 | 0.022 | 1.34 |
-| 10 | 0.72 | 0.006 | 0.009 | 1.24 |
-| 15 | 0.59 | 0.006 | 0.003 | 1.24 |
-| 20 | 0.53 | 0.006 | 0.002 | 1.24 |
+| 阶段 | 数据 | 最佳 Val | 过拟合 |
+|------|------|----------|--------|
+| Full (旧) | val2017 2000 | 1.24 | 有 |
+| Pure LM | val2017 2000 | 1.64→3.22 | 严重 |
+| Full v2 | val2017 5000 | 1.61→2.74 | 有 |
+| **COCO LM v1** | **train2017 50K** | **1.01** | **无** |
+| **COCO LM v2** | **train2017 50K +20ep** | **0.98** | **轻** |
 
-最佳 val_loss=1.23 (epoch 13), checkpoint: `checkpoints_phase6_full/best.pt`
+结论：50K 真实图像是 30M 模型泛化的最小数据量。
 
-## DPO 对齐训练结果 (5 epochs)
+## Audio-CLIP (P1 突破)
 
-| Epoch | train_loss | train_acc | val_acc |
-|-------|-----------|-----------|---------|
-| 1 | 0.691 | 55.1% | 64.4% |
-| 3 | 0.484 | 82.1% | 65.4% |
-| 5 | 0.411 | 89.4% | 63.5% |
+| Epoch | Loss | R@1 | R@5 | R@10 |
+|-------|------|-----|-----|------|
+| 1 | 3.03 | 2.7% | 14.3% | 30.0% |
+| 5 | 0.80 | 69.3% | 92.3% | 95.7% |
+| 10 | 0.48 | **88.0%** | 93.7% | 95.3% |
 
-最佳 val_acc=65.4%, checkpoint: `checkpoints_phase6_dpo/best.pt`
+50类环境声音识别 R@1=88%，随机基线 2%。checkpoint: `checkpoints_phase6_audio_clip/best.pt`
+
+## DPO 演进
+
+| 版本 | 基座 val | 数据 | val_acc |
+|------|----------|------|---------|
+| v1 (旧) | 1.24 (合成主导) | COCO 1000图 | 65.4% |
+| v3 (新) | **0.98 (train2017)** | COCO 5000图 | **70.7%** |
+
+checkpoint: `checkpoints_phase6_dpo_v3/best.pt`
 
 ---
 
-## 瓶颈分析
+## 后续方向（按优先级）
 
-1. **生成质量受限**：模型 90% 训练数据为合成几何图形，COCO 真实文本仅 20 epochs
-2. **LM 能力不足**：COCO 图像 LM loss=0.53，远高于合成数据 (0.012)，语义理解弱
-3. **语言多样性低**：合成模板句式单一 (10 种)，远不及自然语言多样性
+### P0: 延长 COCO LM 至 50 epochs
+- 当前 20 epochs，val 0.98 仍在下降
+- 目标 val ≤ 0.7，内容准确性显著提升
+- 预计时间：~4 小时
+```
+python train_unified.py --mode coco_lm \
+  --resume checkpoints_phase6_coco_lm_v2/best.pt \
+  --epochs 30 --ann-file ... --val-ann-file ...
+```
 
-## 后续方向（建议优先级）
+### P1: 全模态联合 (train2017)
+- 50K 图重建 + LM + Audio/Video 联合训练
+- 同时优化所有模态
+- 预计时间：~6 小时
 
-### P0: 提升生成质量
-- 延长 COCO LM 预训练 50-100 epochs
-- 混合更多真实数据集 (Flickr30k, TextCaps)
-- 预期：BLEU-1 突破 0.0, DPO 效果显著提升
+### P2: 推理部署
+- INT8 量化优化 → ≤20MB
+- ONNX 导出 (CPU 推理)
+- 流式 token 输出 API
 
-### P1: Audio-CLIP
-- ESC-50 数据已就绪，桩代码 `train_audio_clip.py`
-- 在 `train_unified.py` 添加 `--mode audio_clip`
-
-### P2: Eval/Demo 迁移
-- `eval_lib.py` 已创建共享函数
-- 旧 eval/demo 脚本迁移为薄包装
-
-### P3: 推理优化
-- INT8 ≤ 20MB, ONNX 导出, 流式推理
+### P3: 完整 74K 图像训练
+- 使用全部 train2017 (74K) + 混合 train2014 (3K)
+- 预计 val 进一步降低 10-15%
+- 需要 --no-pre-cache 流式加载

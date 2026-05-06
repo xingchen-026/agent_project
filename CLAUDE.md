@@ -8,6 +8,10 @@ Tiny Multimodal Transformer — 30.97M param native multimodal (text+image+audio
 
 **Architecture**: 8-layer SwiGLU transformer (MoE optional), 448 dim, 7 heads, RMSNorm, RoPE, QK Norm. MemoryBank (16 mem tokens), CLIP contrastive head, Diffusion DDIM decoder.
 
+## Rules
+
+- **Data downloading is the user's responsibility.** When external data is needed, provide the download URL and instructions to the user — never attempt to download datasets, annotation files, or pretrained weights yourself. Wait for the user to confirm the data is in place before proceeding.
+
 ## Commands
 
 ```powershell
@@ -29,15 +33,24 @@ python train_unified.py --mode full --resume ../checkpoints_phase6/best.pt --epo
 python train_unified.py --mode joint --resume ../checkpoints_phase6/best.pt --epochs 15
 python train_unified.py --mode clip --resume ../checkpoints_phase6/best.pt --epochs 10
 python train_unified.py --mode distill --resume ../checkpoints_phase6/best.pt --epochs 10
+python train_unified.py --mode audio_clip --resume ../checkpoints_phase6/best.pt --epochs 10
+
+# ── COCO LM (large-scale, use --no-pre-cache for >5000 images) ──
+python train_unified.py --mode coco_lm \
+  --resume ../checkpoints_phase6/best.pt --epochs 20 \
+  --ann-file ../coco_data/annotations/captions_train2017.json \
+  --val-ann-file ../coco_data/captions_val2017.json \
+  --max-images 50000 --no-pre-cache
 
 # ── DPO alignment ──
-python train_dpo.py --resume ../checkpoints_phase6_full/best.pt --epochs 5
+python train_dpo.py --resume ../checkpoints_phase6_coco_lm_v2/best.pt --epochs 5
 
 # ── Run scripts ──
 ..\run.ps1 phase6_full         # Full multi-modal joint (image+audio+video)
 ..\run.ps1 phase6_joint        # CLIP+LM+Diffusion
 ..\run.ps1 phase6_clip         # CLIP contrastive
 ..\run.ps1 phase6_distill      # Knowledge distillation
+..\run.ps1 phase6_audio_clip   # Audio-CLIP on ESC-50
 ..\run.ps1 phase6              # Base from scratch (448d-8L-7h)
 
 # ── Finetune (separate scripts) ──
@@ -94,10 +107,12 @@ python quantize_eval.py --checkpoint ../checkpoints_phase6/best.pt
 |-----------|------|-------------|-------------|
 | `checkpoints_phase6/best.pt` | 118 MB | text=0.012 | Base 30.97M |
 | `checkpoints_phase6_clip/` | 346 MB | R@1=20% | CLIP contrastive |
+| `checkpoints_phase6_audio_clip/` | — | **R@1=88%** | Audio-CLIP ESC-50 |
 | `checkpoints_phase6_distill/` | 178 MB | cos=0.45 | Distillation |
 | `checkpoints_phase6_joint/` | 380 MB | val=1.33 | CLIP+LM+Diff |
 | `checkpoints_phase6_full/best.pt` | ~380 MB | val=1.24 | Full joint (20ep) |
-| `checkpoints_phase6_dpo/best.pt` | ~380 MB | acc=65.4% | DPO tuned |
+| `checkpoints_phase6_coco_lm_v2/` | — | **val=0.98** | COCO LM 50K图 20ep |
+| `checkpoints_phase6_dpo_v3/` | — | **acc=70.7%** | DPO from coco_lm |
 | `checkpoints_phase6_vqa/` | 330 MB | — | VQA finetuned |
 
 ## Dataset Inventory

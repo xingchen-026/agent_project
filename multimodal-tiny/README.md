@@ -4,18 +4,19 @@
 
 ## 项目状态
 
-当前：**Phase 6+ Generation** — CLIP + MoE + Diffusion + DPO 全能力
+当前：**Phase 6+ Generation** — COCO train2017 LM val=0.98, 生成完整英语句子
 
 | 能力 | 指标 | 状态 |
 |------|------|:----:|
 | 基座多模态 | 448d-8L-7h, text+image+audio+video | ✅ |
 | CLIP 对比学习 | R@1=20% (COCO) | ✅ |
+| **Audio-CLIP** | **R@1=88% (ESC-50 50类)** | ✅ |
 | 知识蒸馏 | ResNet50→MemoryBank cos=0.45 | ✅ |
 | Diffusion 解码 | Latent DDIM 10 步采样 | ✅ |
 | MoE 推理 | 8 专家, 2.3× 参数/FLOPs | ✅ |
-| DPO 对齐 | val_acc=65.4% | ✅ |
+| **COCO LM 大规模** | **val=0.98 (train2017 50K图像)** | ✅ |
+| **DPO 对齐 v3** | **val_acc=70.7%, 语法正确句子** | ✅ |
 | 中文支持 | 1510 tokens, COCO-CN, VQA | ✅ |
-| 全模态联合训练 | val=1.24 (20 epoch) | ✅ |
 
 ## 环境
 
