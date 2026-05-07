@@ -25,11 +25,11 @@ _src_dir = os.path.dirname(os.path.abspath(__file__))
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
-from model import TinyMultimodal
-from tokenizer import SimpleTokenizer
-from config import resolve_config, ModelConfig
+from core.model import TinyMultimodal
+from core.tokenizer import SimpleTokenizer
+from core.config import resolve_config, ModelConfig
 from utils import load_checkpoint_adaptive
-from losses import compute_psnr, compute_snr, bleu_score, rouge_l, mse_loss
+from training.losses import compute_psnr, compute_snr, bleu_score, rouge_l, mse_loss
 
 
 # ── Model Loading ───────────────────────────────────────────────────
@@ -71,7 +71,7 @@ def load_eval_model(checkpoint_path, tokenizer=None, device=None,
 
 def load_image_tensor(path_or_array, size=224):
     """Load PIL path or numpy array → [C, H, W] tensor in [-1, 1]."""
-    from data_lib import preprocess_image_path, preprocess_image_pil
+    from data.datasets import preprocess_image_path, preprocess_image_pil
     from PIL import Image as PILImage
 
     if isinstance(path_or_array, (str, Path)):
@@ -96,7 +96,7 @@ def evaluate_coco_generation(model, tokenizer, dataset, device,
         dict with keys: bleu1, bleu4, rouge_l, samples (list of (img_path, gt, gen))
     """
     from torch.utils.data import DataLoader, Subset
-    from data_lib import ImageCaptionCollate
+    from data.datasets import ImageCaptionCollate
 
     if num_samples:
         ds = Subset(dataset, range(min(num_samples, len(dataset))))
@@ -165,11 +165,11 @@ def evaluate_retrieval(model, tokenizer, device, num_images=100, seed=42):
     Returns:
         dict with recall@1, recall@5, recall@10, mrr for both directions
     """
-    from losses import retrieval_accuracy, clip_contrastive_loss
+    from training.losses import retrieval_accuracy, clip_contrastive_loss
 
     # Use synthetic images for quick retrieval benchmark
-    from synthetic_data import SyntheticDataset
-    from data_lib import encode_captions
+    from data.synthetic import SyntheticDataset
+    from data.datasets import encode_captions
 
     ds = SyntheticDataset(num_samples=num_images, image_size=224, seed=seed)
     loader = torch.utils.data.DataLoader(ds, batch_size=min(16, num_images),
@@ -202,7 +202,7 @@ def evaluate_retrieval(model, tokenizer, device, num_images=100, seed=42):
 def plot_image_reconstructions(orig_images, recon_images, psnrs, save_path,
                                 num_show=8, figsize=(16, 8)):
     """Plot original vs reconstructed images side by side."""
-    from data_lib import tensor_to_numpy
+    from data.datasets import tensor_to_numpy
 
     num_show = min(num_show, len(orig_images))
     fig, axes = plt.subplots(2, num_show, figsize=figsize)
@@ -226,7 +226,7 @@ def plot_image_reconstructions(orig_images, recon_images, psnrs, save_path,
 def plot_audio_reconstructions(orig_mels, recon_mels, mses, snrs, save_path,
                                 num_show=4):
     """Plot original vs reconstructed mel spectrograms."""
-    from data_lib import tensor_to_numpy
+    from data.datasets import tensor_to_numpy
 
     num_show = min(num_show, len(orig_mels))
     fig, axes = plt.subplots(2, num_show, figsize=(4 * num_show, 6))
@@ -280,10 +280,10 @@ def plot_training_curves(metric_paths, save_path, title="Training Curves"):
 
 def run_simple_demo(model, tokenizer, device, num_samples=3):
     """Run a quick all-modality test and print results."""
-    from synthetic_data import SyntheticDataset
-    from audio_synthetic import AudioDataset
-    from video_synthetic import VideoDataset
-    from data_lib import encode_captions, tensor_to_numpy
+    from data.synthetic import SyntheticDataset
+    from data.audio_synthetic import AudioDataset
+    from data.video_synthetic import VideoDataset
+    from data.datasets import encode_captions, tensor_to_numpy
 
     print(f"\n{'=' * 50}")
     print("Running Demo Tests")

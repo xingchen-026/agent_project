@@ -15,11 +15,11 @@ import torch.nn.functional as F
 from PIL import Image as PILImage
 import numpy as np
 
-from model import TinyMultimodal, patches_to_image
-from tokenizer import SimpleTokenizer
-from config import resolve_config
+from core.model import TinyMultimodal, patches_to_image
+from core.tokenizer import SimpleTokenizer
+from core.config import resolve_config
 from utils import load_checkpoint_adaptive
-from synthetic_data import generate_sample, SyntheticDataset
+from data.synthetic import generate_sample, SyntheticDataset
 
 
 def tensor_to_pil(tensor):

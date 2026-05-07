@@ -18,9 +18,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from model import TinyMultimodal
-from tokenizer import SimpleTokenizer
-from config import resolve_config
+from core.model import TinyMultimodal
+from core.tokenizer import SimpleTokenizer
+from core.config import resolve_config
 from utils import load_checkpoint_adaptive
 
 SAMPLE_RATE = 16000
@@ -186,7 +186,7 @@ def evaluate(model, tokenizer, device, samples, args):
 
 def synthetic_baseline(model, device, num_samples=30, seed=42):
     """Evaluate on synthetic audio for comparison."""
-    from audio_synthetic import AudioDataset
+    from data.audio_synthetic import AudioDataset
     ds = AudioDataset(num_samples=num_samples, seed=seed)
     samples = []
     for i in range(num_samples):

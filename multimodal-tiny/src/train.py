@@ -19,13 +19,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from tqdm import tqdm
 
-from model import TinyMultimodal, ModelConfig, patches_to_image, mel_patches_to_spectrogram
+from core.model import TinyMultimodal, ModelConfig, patches_to_image, mel_patches_to_spectrogram
 from utils import compute_text_loss, compute_mse_loss, load_checkpoint_flexible, \
     make_collate, interleave_loaders, logger
 from data import build_loaders
-from synthetic_data import SyntheticDataset
-from audio_synthetic import AudioDataset
-from video_synthetic import VideoDataset
+from data.synthetic import SyntheticDataset
+from data.audio_synthetic import AudioDataset
+from data.video_synthetic import VideoDataset
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -91,13 +91,13 @@ def train():
     print(f"Mode: {phase}")
 
     # ── Tokenizer ──
-    from tokenizer import SimpleTokenizer
+    from core.tokenizer import SimpleTokenizer
     print("Building local tokenizer...")
     tokenizer = SimpleTokenizer(max_vocab=10000)
 
     # ── Config ──
     if args.config:
-        from config import ModelConfig as MC
+        from core.config import ModelConfig as MC
         cfg = MC.from_json(args.config)
         print(f"Loaded config from {args.config}: {cfg.describe()}")
     else:

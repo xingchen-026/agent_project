@@ -67,7 +67,7 @@ case "$PHASE" in
   phase5)
     echo "=== Phase 5: Chinese Fine-tuning ==="
     export CUDA_VISIBLE_DEVICES=0
-    PYTHONIOENCODING=utf-8 python src/finetune_cn.py \
+    PYTHONIOENCODING=utf-8 python src/scripts/finetune_cn.py \
       --resume checkpoints_phase4_5/best.pt --epochs 10 \
       "$@"
     ;;
@@ -75,7 +75,7 @@ case "$PHASE" in
     echo "=== Phase 5 v2: Continued Chinese Fine-tuning ==="
     export CUDA_VISIBLE_DEVICES=0
     export PYTHONIOENCODING=utf-8
-    python src/finetune_cn.py \
+    python src/scripts/finetune_cn.py \
       --resume checkpoints_phase5/best.pt --epochs 20 \
       --batch_size 24 --lr 1e-4 --no_warmup \
       --train_size 5000 --val_size 200 \
@@ -103,7 +103,7 @@ case "$PHASE" in
     echo "=== Phase 6 + COCO-CN: Real Chinese Image Fine-tuning ==="
     export CUDA_VISIBLE_DEVICES=0
     export PYTHONIOENCODING=utf-8
-    python src/finetune_coco_cn.py \
+    python src/scripts/finetune_coco_cn.py \
       --resume checkpoints_phase6/best.pt --epochs 15 \
       "$@"
     ;;
@@ -111,7 +111,7 @@ case "$PHASE" in
     echo "=== Phase 6 + VQA: Chinese Instruction Tuning ==="
     export CUDA_VISIBLE_DEVICES=0
     export PYTHONIOENCODING=utf-8
-    python src/finetune_vqa.py \
+    python src/scripts/finetune_vqa.py \
       --resume checkpoints_phase6_cn/best.pt --epochs 5 \
       "$@"
     ;;
@@ -119,7 +119,7 @@ case "$PHASE" in
     echo "=== Phase 6: CLIP Contrastive Pre-training ==="
     export CUDA_VISIBLE_DEVICES=0
     export PYTHONIOENCODING=utf-8
-    python src/train_unified.py --mode clip \
+    python src/scripts/train.py --mode clip \
       --resume checkpoints_phase6/best.pt --epochs 10 \
       "$@"
     ;;
@@ -127,7 +127,7 @@ case "$PHASE" in
     echo "=== Phase 6: CLIP+LM+Diffusion Joint Training ==="
     export CUDA_VISIBLE_DEVICES=0
     export PYTHONIOENCODING=utf-8
-    python src/train_unified.py --mode joint \
+    python src/scripts/train.py --mode joint \
       --resume checkpoints_phase6/best.pt --epochs 15 \
       "$@"
     ;;
@@ -135,19 +135,26 @@ case "$PHASE" in
     echo "=== Phase 6: Full Multi-Modal Joint Training (Image+Audio+Video) ==="
     export CUDA_VISIBLE_DEVICES=0
     export PYTHONIOENCODING=utf-8
-    python src/train_unified.py --mode full \
+    python src/scripts/train.py --mode full \
       --resume checkpoints_phase6/best.pt --epochs 20 \
       "$@"
     ;;
   phase6_distill)
     echo "=== Phase 6: Knowledge Distillation (ResNet50 -> MemoryBank) ==="
     export CUDA_VISIBLE_DEVICES=0
-    python src/train_unified.py --mode distill \
+    python src/scripts/train.py --mode distill \
+      --resume checkpoints_phase6/best.pt --epochs 10 \
+      "$@"
+    ;;
+  phase6_audio_clip)
+    echo "=== Phase 6: Audio-CLIP Contrastive (ESC-50) ==="
+    export CUDA_VISIBLE_DEVICES=0
+    python src/scripts/train.py --mode audio_clip \
       --resume checkpoints_phase6/best.pt --epochs 10 \
       "$@"
     ;;
   *)
-    echo "Usage: ./run.sh {phase2|...|phase6|phase6_cn|phase6_vqa|phase6_joint|phase6_full|phase6_clip|phase6_distill} [extra args]"
+    echo "Usage: ./run.sh {phase2|...|phase6|phase6_cn|phase6_vqa|phase6_joint|phase6_full|phase6_clip|phase6_distill|phase6_audio_clip} [extra args]"
     exit 1
     ;;
 esac

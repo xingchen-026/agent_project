@@ -12,10 +12,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import TinyMultimodal
-from tokenizer import SimpleTokenizer
-from config import resolve_config
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.model import TinyMultimodal
+from core.tokenizer import SimpleTokenizer
+from core.config import resolve_config
 from utils import compute_text_loss, compute_mse_loss, make_collate, interleave_loaders, logger, load_checkpoint_adaptive
 
 
@@ -69,7 +69,7 @@ def main():
     
     # ── Chinese Data ──
     print("Building Chinese data loaders...")
-    from cn_data import ZhImageDataset, ZhAudioDataset, ZhVideoDataset
+    from data.cn_data import ZhImageDataset, ZhAudioDataset, ZhVideoDataset
     
     img_collate = make_collate(tokenizer, args.max_text_len, 'image')
     aud_collate = make_collate(tokenizer, args.max_text_len, 'audio')

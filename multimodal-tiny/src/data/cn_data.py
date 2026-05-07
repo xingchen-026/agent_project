@@ -12,15 +12,15 @@ import numpy as np
 from torch.utils.data import Dataset
 from PIL import Image, ImageDraw
 
-from synthetic_data import (
+from data.synthetic import (
     _render_shape, SHAPES, COLORS, POSITIONS, SIZES, BACKGROUNDS,
 )
-from audio_synthetic import (
+from data.audio_synthetic import (
     _sine_wave, _square_wave, _white_noise,
     _amplitude_modulated, _frequency_modulated,
     waveform_to_mel, N_FRAMES, SAMPLE_RATE, DURATION,
 )
-from video_synthetic import (
+from data.video_synthetic import (
     _draw_shape_on_canvas, VIDEO_FRAMES, VIDEO_RESOLUTION,
 )
 

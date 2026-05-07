@@ -16,9 +16,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from model import TinyMultimodal
-from tokenizer import SimpleTokenizer
-from config import resolve_config
+from core.model import TinyMultimodal
+from core.tokenizer import SimpleTokenizer
+from core.config import resolve_config
 from utils import load_checkpoint_adaptive
 
 
@@ -81,9 +81,9 @@ def _model_dtype(model):
 @torch.no_grad()
 def test_accuracy(model, tokenizer, device, num_samples=20):
     """Test reconstruction accuracy on all modalities."""
-    from synthetic_data import SyntheticDataset
-    from audio_synthetic import AudioDataset
-    from video_synthetic import VideoDataset
+    from data.synthetic import SyntheticDataset
+    from data.audio_synthetic import AudioDataset
+    from data.video_synthetic import VideoDataset
 
     dtype = _model_dtype(model)
     results = {}
@@ -130,9 +130,9 @@ def test_accuracy(model, tokenizer, device, num_samples=20):
 @torch.no_grad()
 def benchmark_speed(model, tokenizer, device, num_iters=50):
     """Measure inference latency for each modality."""
-    from synthetic_data import SyntheticDataset
-    from audio_synthetic import AudioDataset
-    from video_synthetic import VideoDataset
+    from data.synthetic import SyntheticDataset
+    from data.audio_synthetic import AudioDataset
+    from data.video_synthetic import VideoDataset
 
     latencies = {}
 

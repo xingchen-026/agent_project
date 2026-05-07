@@ -62,14 +62,14 @@ switch ($Phase) {
   }
   "phase5" {
     Write-Host "=== Phase 5: Chinese Fine-tuning ==="
-    python src/finetune_cn.py `
+    python src/scripts/finetune_cn.py `
       --resume checkpoints_phase4_5/best.pt --epochs 10 `
       @ExtraArgs
   }
   "phase5_v2" {
     Write-Host "=== Phase 5 v2: Continued Chinese Fine-tuning ==="
     python -c "import torch; print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')"
-    python src/finetune_cn.py `
+    python src/scripts/finetune_cn.py `
       --resume checkpoints_phase5/best.pt `
       --epochs 20 --batch_size 24 --lr 1e-4 --no_warmup `
       --train_size 5000 --val_size 200 `
@@ -95,41 +95,47 @@ switch ($Phase) {
   "phase6_cn" {
     Write-Host "=== Phase 6 + COCO-CN: Real Chinese Image Fine-tuning ==="
     $env:PYTHONIOENCODING = "utf-8"
-    python src/finetune_coco_cn.py `
+    python src/scripts/finetune_coco_cn.py `
       --resume checkpoints_phase6/best.pt --epochs 15 `
       @ExtraArgs
   }
   "phase6_vqa" {
     Write-Host "=== Phase 6 + VQA: Chinese Instruction Tuning ==="
     $env:PYTHONIOENCODING = "utf-8"
-    python src/finetune_vqa.py `
+    python src/scripts/finetune_vqa.py `
       --resume checkpoints_phase6_cn/best.pt --epochs 5 `
       @ExtraArgs
   }
   "phase6_clip" {
     Write-Host "=== Phase 6 + CLIP: Contrastive Pre-training ==="
     $env:PYTHONIOENCODING = "utf-8"
-    python src/train_unified.py --mode clip `
+    python src/scripts/train.py --mode clip `
       --resume checkpoints_phase6/best.pt --epochs 10 `
       @ExtraArgs
   }
   "phase6_joint" {
     Write-Host "=== Phase 6: CLIP+LM+Diffusion Joint Training ==="
     $env:PYTHONIOENCODING = "utf-8"
-    python src/train_unified.py --mode joint `
+    python src/scripts/train.py --mode joint `
       --resume checkpoints_phase6/best.pt --epochs 15 `
       @ExtraArgs
   }
   "phase6_full" {
     Write-Host "=== Phase 6: Full Multi-Modal Joint Training (Image+Audio+Video) ==="
     $env:PYTHONIOENCODING = "utf-8"
-    python src/train_unified.py --mode full `
+    python src/scripts/train.py --mode full `
       --resume checkpoints_phase6/best.pt --epochs 20 `
       @ExtraArgs
   }
   "phase6_distill" {
     Write-Host "=== Phase 6: Knowledge Distillation (ResNet50 -> MemoryBank) ==="
-    python src/train_unified.py --mode distill `
+    python src/scripts/train.py --mode distill `
+      --resume checkpoints_phase6/best.pt --epochs 10 `
+      @ExtraArgs
+  }
+  "phase6_audio_clip" {
+    Write-Host "=== Phase 6: Audio-CLIP Contrastive (ESC-50) ==="
+    python src/scripts/train.py --mode audio_clip `
       --resume checkpoints_phase6/best.pt --epochs 10 `
       @ExtraArgs
   }
@@ -137,11 +143,11 @@ switch ($Phase) {
     Write-Host "=== Web Demo (Gradio) ==="
     $env:PYTHONIOENCODING = "utf-8"
     pip install gradio -q 2>$null
-    python src/demo/web_app.py `
+    python src/demo/web.py `
       --checkpoint checkpoints_phase6_vqa/best.pt `
       @ExtraArgs
   }
   default {
-    Write-Host "Usage: .\run.ps1 {phase2|...|phase6|phase6_clip|phase6_joint|phase6_full|phase6_distill|web} [extra args]"
+    Write-Host "Usage: .\run.ps1 {phase2|...|phase6|phase6_clip|phase6_joint|phase6_full|phase6_distill|phase6_audio_clip|web} [extra args]"
   }
 }

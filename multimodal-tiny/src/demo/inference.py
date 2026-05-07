@@ -18,15 +18,15 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from model import TinyMultimodal, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
-from tokenizer import SimpleTokenizer
-from synthetic_data import SyntheticDataset
-from audio_synthetic import AudioDataset
-from video_synthetic import VideoDataset
-from eval_lib import load_eval_model
-from data_lib import tensor_to_numpy
-from losses import compute_psnr, compute_snr
-from training import print_header
+from core.model import TinyMultimodal, patches_to_image, mel_patches_to_spectrogram, video_patches_to_frames
+from core.tokenizer import SimpleTokenizer
+from data.synthetic import SyntheticDataset
+from data.audio_synthetic import AudioDataset
+from data.video_synthetic import VideoDataset
+from eval.loader import load_eval_model
+from data.datasets import tensor_to_numpy
+from training.losses import compute_psnr, compute_snr
+from training.optimizers import print_header
 
 
 def get_args():
