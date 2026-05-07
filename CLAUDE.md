@@ -115,6 +115,8 @@ python quantize_eval.py --checkpoint ../checkpoints_phase6/best.pt
 | `checkpoints_phase6_dpo_v3/` | — | **acc=70.7%** | DPO from coco_lm |
 | `checkpoints_phase6_vqa/` | 330 MB | — | VQA finetuned |
 
+val≈0.98 is the current hard ceiling at 50K images × 27.75M params (verified 3x).
+
 ## Dataset Inventory
 
 | Dataset | Location | Size | Status |
